@@ -100,6 +100,17 @@
 #include <cxxabi.h>
 #endif
 
+// Web SDK
+#ifdef TARGET_PLATFORM_WEB
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include <dlfcn.h>
+#include <unistd.h>
+#include <limits.h>
+#include <cxxabi.h>
+#endif
+
 // C++ SDK
 #include <stddef.h>
 #include <stdarg.h>
@@ -464,6 +475,7 @@ namespace jenova
 		AsmJIT,
 		TinyCC,
 		LibFFI,
+		Direct,
 		Unknown
 	};
 	enum class ProfilingMode
@@ -877,6 +889,7 @@ namespace jenova
 		constexpr char* ScriptActivatorIdentifier				= "JENOVA_ACTIVATOR";
 		constexpr char* ScriptFunctionExportIdentifier			= "JENOVA_EXPORT";
 		constexpr char* DefaultModuleDatabaseFile				= "JenovaRuntime.jdb";
+		constexpr char* DefaultWebModuleDatabaseFile			= "JenovaRuntime.web.jdb";
 		constexpr char* DefaultModuleConfigFile					= "JenovaRuntime.cfg";
 		constexpr char* DefaultRuntimeConfigFile				= "JenovaRuntime.json";
 		constexpr char* DefaultJenovaBootPath					= "res://J.E.N.O.V.A/";
@@ -1119,10 +1132,12 @@ namespace jenova
 	Variant::Type GetVariantTypeFromStdString(const std::string& typeName);
 	jenova::ScriptPropertyContainer CreatePropertyContainerFromMetadata(const jenova::SerializedData& propertyMetadata, const std::string& scriptUID);
 	void CleanVariantTypeName(std::string& typeName);
+	std::string NormalizeScalarTypeName(const std::string& typeName);
+	bool IsNarrowIntegerTypeName(const std::string& typeName);
 	void* AllocateVariantBasedProperty(const std::string& typeName);
 	void FreeVariantBasedProperty(void* propertyPointer, const std::string& typeName);
 	bool SetPropertyPointerValueFromVariant(jenova::PropertyPointer propertyPointer, const Variant& variantValue);
-	bool GetVariantFromPropertyPointer(const jenova::PropertyPointer propertyPointer, godot::Variant& variantValue, const Variant::Type& variantType);
+	bool GetVariantFromPropertyPointer(const jenova::PropertyPointer propertyPointer, godot::Variant& variantValue, const Variant::Type& variantType, const std::string& declaredTypeName = std::string());
 	Variant CreateDefaultVariantFromType(Variant::Type variantType);
 	std::string ParseClassNameFromScriptSource(const std::string& sourceCode);
 	jenova::ScriptFileState BackupScriptFileState(const std::string& scriptFilePath);

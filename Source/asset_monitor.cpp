@@ -15,8 +15,11 @@
 // Jenova SDK
 #include "Jenova.hpp"
 
-// Third-Party SDK
+// Third-Party SDK. FileWatch is inotify-based, and there is no filesystem to watch in a
+// browser, so the Web build keeps the interface and does nothing.
+#ifndef TARGET_PLATFORM_WEB
 #include <FileWatch/FileWatch.hpp>
+#endif
 
 // Helpers
 static String GetCallbackEventStringName(jenova::AssetMonitor::CallbackEvent callbackEvent)
@@ -39,7 +42,9 @@ static String GetCallbackEventStringName(jenova::AssetMonitor::CallbackEvent cal
 }
 
 // Global Storage
+#ifndef TARGET_PLATFORM_WEB
 Vector<filewatch::FileWatch<std::string>*> assetMonitors;
+#endif
 Vector<jenova::AssetMonitor::AssetMonitorCallback> monitorCallbacks;
 std::unordered_map<std::string, jenova::SystemTimePoint> lastRead;
 
@@ -88,6 +93,9 @@ JenovaAssetMonitor* JenovaAssetMonitor::get_singleton()
 // Jenova Asset Monitor Implementation
 bool JenovaAssetMonitor::AddDirectory(const String& directoryPath) 
 {
+#ifdef TARGET_PLATFORM_WEB
+	return true;
+#else
 	// Create New Asset Monitor
 	#ifdef _MSC_VER
 	auto assetMonitor = new filewatch::FileWatch<std::string>(AS_STD_STRING(directoryPath), [](const std::string& path, const filewatch::Event change_type)
@@ -136,6 +144,7 @@ bool JenovaAssetMonitor::AddDirectory(const String& directoryPath)
 
 	// All Good
 	return true;
+#endif
 }
 bool JenovaAssetMonitor::AddDirectories(const PackedStringArray& directoryList) 
 {
@@ -178,7 +187,9 @@ bool JenovaAssetMonitor::PrepareForShutdown()
 {
 	// Clear Resources
 	monitorCallbacks.clear();
+	#ifndef TARGET_PLATFORM_WEB
 	for (const auto& assetMonitor : assetMonitors) delete assetMonitor;
+	#endif
 	
 	// All Good
 	return true;

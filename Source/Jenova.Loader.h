@@ -246,3 +246,60 @@ private:
 };
 
 #endif
+
+#ifdef TARGET_PLATFORM_WEB
+
+/*
+	Loader Interface [Web]
+
+	Emscripten's dlopen only takes a path, and there is no link_map to ask for a load
+	address. The module is written to the in-memory filesystem and opened from there, and
+	the interpreter resolves script functions by symbol name instead of by base + offset.
+*/
+class JenovaLoader
+{
+public:
+	static bool Initialize() { return true; }
+	static bool Release() { return true; }
+	static bool SetAgressiveMode(bool agrState) { aggressiveMode = agrState; return true; }
+	static jenova::ModuleHandle LoadModule(void* bufferPtr, size_t bufferSize, int flags = 0)
+	{
+		const char* modulePath = "/tmp/jenova_module.wasm";
+		FILE* moduleFile = fopen(modulePath, "wb");
+		if (!moduleFile)
+		{
+			fprintf(stderr, "[Jenova Loader] Failed to stage module.\n");
+			return nullptr;
+		}
+		const size_t written = fwrite(bufferPtr, 1, bufferSize, moduleFile);
+		fclose(moduleFile);
+		if (written != bufferSize) return nullptr;
+
+		void* handle = dlopen(modulePath, RTLD_NOW | RTLD_GLOBAL | flags);
+		if (!handle) fprintf(stderr, "[Jenova Loader] dlopen failed: %s\n", dlerror());
+		return reinterpret_cast<jenova::ModuleHandle>(handle);
+	}
+	static jenova::ModuleHandle LoadModuleAsVirtual(void* bufferPtr, size_t bufferSize, const char* moduleName, const char* modulePath, int flags = 0)
+	{
+		return LoadModule(bufferPtr, bufferSize, flags);
+	}
+
+	// Symbol addresses come back absolute from dlsym, so there is no base to add.
+	static jenova::ModuleAddress GetModuleBaseAddress(jenova::ModuleHandle moduleHandle) { return 0; }
+	static void* GetVirtualFunction(jenova::ModuleHandle moduleHandle, const char* functionName)
+	{
+		return dlsym(moduleHandle, functionName);
+	}
+	static bool ReleaseModule(jenova::ModuleHandle moduleHandle)
+	{
+		if (!moduleHandle) return false;
+		if (!aggressiveMode) return true;
+		dlclose(moduleHandle);
+		return true;
+	}
+
+private:
+	static inline bool aggressiveMode = false;
+};
+
+#endif

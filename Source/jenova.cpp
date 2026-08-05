@@ -496,7 +496,7 @@ namespace jenova
 
 						// Interpreter Backend Property
 						PropertyInfo InterpreterBackendProperty(Variant::INT, InterpreterBackendConfigPath,
-							PropertyHint::PROPERTY_HINT_ENUM, "NitroJIT (Fastest),Meteora (Fast),Halo (Soon)",
+							PropertyHint::PROPERTY_HINT_ENUM, "NitroJIT (Fastest),Meteora (Fast),Halo (Soon),Direct (Portable)",
 							PROPERTY_USAGE_NONE, JenovaEditorSettingsCategory);
 						editor_settings->add_property_info(InterpreterBackendProperty);
 						editor_settings->set_initial_value(InterpreterBackendConfigPath, int32_t(InterpreterBackendDefaultMode), false);
@@ -4294,6 +4294,7 @@ namespace jenova
 				// Supports Windows
 				if (p_platform->get_os_name() == "Windows") return true;
 				if (p_platform->get_os_name() == "Linux") return true;
+				if (p_platform->get_os_name() == "Web") return true;
 
 				// Unsupported Platform
 				return false;
@@ -4337,10 +4338,65 @@ namespace jenova
 				this->add_file(runtimeConfigPath, packedRuntimeData, false);
 				packedRuntimeData.clear();
 
+				/*
+					Cross-compile scripts for the Web.
+
+					The editor's build produced a desktop module; a Web export needs the same
+					scripts built for wasm32, which only Emscripten can do. Doing it here keeps
+					the Web a normal export target: the same source, no per-platform code, no
+					separate command to remember.
+				*/
+				if (p_features.has("web"))
+				{
+					std::string projectPath = AS_STD_STRING(ProjectSettings::get_singleton()->globalize_path("res://"));
+					std::string packerPath = projectPath + "Jenova/Tools/Jenova.WebPacker.py";
+					if (!std::filesystem::exists(packerPath))
+					{
+						jenova::Error("Jenova Exporter", "Web Packer Not Found at '%s'. Extract the Web distribution package into the project.", packerPath.c_str());
+						return;
+					}
+
+					jenova::Output("[color=#729bed][Build][/color] Compiling Jenova Scripts for WebAssembly...");
+					#ifdef TARGET_PLATFORM_WINDOWS
+						#define JENOVA_OPEN_PIPE _popen
+						#define JENOVA_CLOSE_PIPE _pclose
+						std::string pythonBinary = "python";
+					#else
+						#define JENOVA_OPEN_PIPE popen
+						#define JENOVA_CLOSE_PIPE pclose
+						std::string pythonBinary = "python3";
+					#endif
+					std::string packerCommand = pythonBinary + " \"" + packerPath + "\" \"" + projectPath + "\" 2>&1";
+					std::string packerOutput;
+					FILE* packerPipe = JENOVA_OPEN_PIPE(packerCommand.c_str(), "r");
+					if (packerPipe)
+					{
+						char lineBuffer[512];
+						while (fgets(lineBuffer, sizeof(lineBuffer), packerPipe)) packerOutput += lineBuffer;
+					}
+					if (!packerPipe || JENOVA_CLOSE_PIPE(packerPipe) != 0)
+					{
+						jenova::Error("Jenova Exporter", "Failed to Build Jenova Scripts for WebAssembly :\n%s", packerOutput.c_str());
+						return;
+					}
+					jenova::Output("[color=#729bed][Build][/color] %s", packerOutput.c_str());
+					#undef JENOVA_OPEN_PIPE
+					#undef JENOVA_CLOSE_PIPE
+				}
+
 				// Add Module Cache File
 				jenova::Output("[color=#729bed][Build][/color] Generating Jenova Runtime Module Data...");
 				String runtimeCachePath = String(jenova::GlobalSettings::DefaultJenovaBootPath) + String(jenova::GlobalSettings::DefaultModuleDatabaseFile);
 				String defaultModuleDatabasePath = jenova::GetJenovaCacheDirectory() + String(jenova::GlobalSettings::DefaultModuleDatabaseFile);
+
+				// A Web export ships the WebAssembly module instead, built by the Web packer.
+				// It is packed under the same name, so nothing downstream has to know.
+				if (p_features.has("web"))
+				{
+					String webModuleDatabasePath = jenova::GetJenovaCacheDirectory() + String(jenova::GlobalSettings::DefaultWebModuleDatabaseFile);
+					if (FileAccess::file_exists(webModuleDatabasePath)) defaultModuleDatabasePath = webModuleDatabasePath;
+					else jenova::Warning("Jenova Deployer", "WebAssembly Module Not Found, Your Build Will Not Work Properly!");
+				}
 				if (FileAccess::file_exists(defaultModuleDatabasePath))
 				{
 					Ref<FileAccess> fileAccess = FileAccess::open(defaultModuleDatabasePath, FileAccess::READ);
@@ -5065,6 +5121,11 @@ namespace jenova
 		// Wrapper
 		static bool CheckWrapperInitialization()
 		{
+			// The wrapper is a desktop-only arrangement, where a stub library forwards to the
+			// real runtime sitting next to it. On Web the runtime is the side module Godot
+			// loads directly, and there is no module path to compare against.
+			if (QUERY_PLATFORM(Web)) return false;
+
 			std::string currentModuleName = std::filesystem::path(GlobalStorage::CurrentJenovaRuntimeModulePath).filename().string();
 			std::string runtimeModuleName = std::string(GlobalSettings::JenovaRuntimeModuleName);
 			if (QUERY_PLATFORM(Windows)) runtimeModuleName += ".Win64.dll";
@@ -8387,18 +8448,59 @@ namespace jenova
 		if (variantValue->get_type() == Variant::INT) return "long long int";
 		return "void*";
 	}
+	static std::string ClassifyScalarSpelling(const std::string& typeName)
+	{
+		if (typeName == "bool") return "bool";
+		if (typeName == "float") return "float";
+		if (typeName == "double") return "double";
+		if (typeName == "int" || typeName == "int32_t" || typeName == "signed int") return "int32";
+		if (typeName == "uint" || typeName == "uint32_t" || typeName == "unsigned int" || typeName == "unsigned") return "uint32";
+		if (typeName == "int64" || typeName == "int64_t" || typeName == "long long" || typeName == "ptrdiff_t") return "int64";
+		if (typeName == "uint64" || typeName == "uint64_t" || typeName == "unsigned long long" || typeName == "size_t") return "uint64";
+
+		// Not a scalar this can rebuild.
+		return std::string();
+	}
+	std::string NormalizeScalarTypeName(const std::string& typeName)
+	{
+		/*
+			One place that knows what scalar a script declared actually is.
+
+			The same type has several spellings in real script sources (`int64_t` and
+			`long long` are the same eight bytes), and both the thunk's declared return type
+			and the width the result is read back at have to agree with the callee. They did
+			not: `int64_t` matched no case and was treated as a Variant, so the thunk
+			declared a hidden-pointer return for a function returning in a register.
+
+			This runs per call on the returning path, so the spelling as written is matched
+			first and the copy needed to clean a name is only made for names that carry a
+			reference, pointer or namespace. Every result is short enough to stay inside a
+			std::string's own storage, so none of this allocates.
+		*/
+		std::string asWritten = ClassifyScalarSpelling(typeName);
+		if (!asWritten.empty()) return asWritten;
+
+		if (typeName.find('*') == std::string::npos && typeName.find('&') == std::string::npos
+			&& typeName.find("godot::") == std::string::npos) return std::string();
+
+		std::string cleaned = typeName;
+		CleanVariantTypeName(cleaned);
+		return ClassifyScalarSpelling(cleaned);
+	}
 	std::string ResolveReturnTypeForJIT(const std::string& returnType)
 	{
 		// No Return
 		if (returnType == "void") return returnType;
 
-		// Basic Types
-		if (returnType == "float" || returnType == "int" || returnType == "uint" || returnType == "double") return returnType;
-
-		// Special Types
-		if (returnType == "bool") return "unsigned char";
-		if (returnType == "int64") return "long long";
-		if (returnType == "uint64") return "unsigned long long";
+		// Scalar Types. Emitted as C type names, because the thunk source is compiled as C.
+		const std::string scalarType = jenova::NormalizeScalarTypeName(returnType);
+		if (scalarType == "bool") return "unsigned char";
+		if (scalarType == "float") return "float";
+		if (scalarType == "double") return "double";
+		if (scalarType == "int32") return "int";
+		if (scalarType == "uint32") return "unsigned int";
+		if (scalarType == "int64") return "long long";
+		if (scalarType == "uint64") return "unsigned long long";
 
 		// Pointer Types
 		if (returnType.find("*") != std::string::npos) 
@@ -8422,26 +8524,23 @@ namespace jenova
 		// Validate Return Type
 		if (returnType == 0) return new Variant(Variant::NIL);
 
-		// Atomic types
-		if (strcmp(returnType, "bool") == 0)
+		/*
+			Atomic types, read at the width the script declared.
+
+			The value behind this pointer is whatever the function actually returned, so
+			reading an `int` return as int64_t picked up four bytes that were never written
+			and produced a garbage number.
+		*/
+		const std::string scalarType = jenova::NormalizeScalarTypeName(returnType);
+		if (!scalarType.empty())
 		{
-			bool value = *(bool*)variantObject;
-			return new Variant(value);
-		}
-		if (strcmp(returnType, "int") == 0)
-		{
-			int64_t value = *(int64_t*)variantObject;
-			return new Variant(value);
-		}
-		if (strcmp(returnType, "float") == 0)
-		{
-			float value = *(float*)variantObject;
-			return new Variant(value);
-		}
-		if (strcmp(returnType, "double") == 0)
-		{
-			double value = *(double*)variantObject;
-			return new Variant(value);
+			if (scalarType == "bool") return new Variant(*(bool*)variantObject);
+			if (scalarType == "float") return new Variant(*(float*)variantObject);
+			if (scalarType == "double") return new Variant(*(double*)variantObject);
+			if (scalarType == "int32") return new Variant(int64_t(*(int32_t*)variantObject));
+			if (scalarType == "uint32") return new Variant(int64_t(*(uint32_t*)variantObject));
+			if (scalarType == "int64") return new Variant(int64_t(*(int64_t*)variantObject));
+			if (scalarType == "uint64") return new Variant(int64_t(*(uint64_t*)variantObject));
 		}
 		if (strcmp(returnType, "godot::String") == 0)
 		{
@@ -9088,6 +9187,12 @@ namespace jenova
 		jenova::ReplaceAllMatchesWithString(typeName, "&", "");
 		jenova::ReplaceAllMatchesWithString(typeName, "godot::", "");
 	}
+	bool IsNarrowIntegerTypeName(const std::string& typeName)
+	{
+		// Integer types a script can declare that occupy four bytes rather than eight.
+		const std::string scalarType = jenova::NormalizeScalarTypeName(typeName);
+		return scalarType == "int32" || scalarType == "uint32";
+	}
 	void* AllocateVariantBasedProperty(const std::string& typeName)
 	{
 		// Clean Type Name
@@ -9438,7 +9543,7 @@ namespace jenova
 			return true;
 		}
 	}
-	bool GetVariantFromPropertyPointer(const jenova::PropertyPointer propertyPointer, godot::Variant& variantValue, const godot::Variant::Type& variantType)
+	bool GetVariantFromPropertyPointer(const jenova::PropertyPointer propertyPointer, godot::Variant& variantValue, const godot::Variant::Type& variantType, const std::string& declaredTypeName)
 	{
 		// Validate Pointer
 		if (!propertyPointer) return false;
@@ -9450,7 +9555,15 @@ namespace jenova
 			variantValue = *static_cast<const bool*>(propertyPointer);
 			break;
 		case godot::Variant::INT:
-			variantValue = *static_cast<const int64_t*>(propertyPointer);
+			/*
+				Read the width the script declared, not the width of the slot. Integer
+				properties are stored in an 8-byte slot so that any of them fits, but a
+				script that declared `int` writes only the low four bytes. Reading all eight
+				returned the high half of whatever the value was before, which turned every
+				negative number a script assigned into a large positive one.
+			*/
+			if (IsNarrowIntegerTypeName(declaredTypeName)) variantValue = int64_t(*static_cast<const int32_t*>(propertyPointer));
+			else variantValue = *static_cast<const int64_t*>(propertyPointer);
 			break;
 		case godot::Variant::FLOAT:
 			variantValue = *static_cast<const double*>(propertyPointer);

@@ -91,7 +91,33 @@ Jenova Runtime can be built on Windows x64 and Linux x64 using **Jenova Builder*
 
 **Linux x64:** Compatible with Clang++ (18+) and G++ (13+).
 
+**Web (WebAssembly):** Requires Emscripten. Build with `--compiler web-emcc`. Scripts are
+cross-compiled during a Web export, so the same sources run on desktop and in the browser
+unchanged; the Web needs a patched export template, described in
+[Misc/Web/ReadMe.md](Misc/Web/ReadMe.md).
+
 For detailed build instructions and more information, see the [Build Guide](https://jenova-framework.github.io/docs/pages/Advanced/Build-Guide).
+
+### One Package For Every Platform
+
+```
+python3 ./Jenova.Builder.py --create-distribution
+```
+
+Merges the platform outputs that have been built into
+`Distribution/Jenova-Framework-AllInOne.7z`. Extracted over a Godot project, that single
+package makes the project portable between Linux and Windows and able to export to
+Windows, Linux and the Web: it carries all three runtime binaries, one `.gdextension` that
+names each of them, the SDK headers, and both GodotSDK packages — x86-64 for desktop
+scripts and wasm32 for Web ones, which are not interchangeable.
+
+A runtime binary can only be produced by its own platform's toolchain, so run the builder
+on each platform you want included and merge afterwards; the package lists what it
+contains in `Jenova/Jenova.Distribution.json` and the merge prints what was left out. The
+package ships SDKs, not compilers: every machine still needs its own C++ toolchain to
+build scripts, which the Package Manager installs for desktop targets. Exporting to the
+Web additionally needs Emscripten and the patched template described in
+[Misc/Web/ReadMe.md](Misc/Web/ReadMe.md).
 
 ## Godot Compatibility
 As of version 0.4.0.0 LTS, **Godot 4.7 Stable** is the minimum required version due to breaking changes in [godot-cpp](https://github.com/godotengine/godot-cpp). While it is still possible to build 0.4.0.0+ for Godot 4.2–4.6 with minor modifications, the official builder is now fully migrated and fine-tuned for Godot 4.7 only.

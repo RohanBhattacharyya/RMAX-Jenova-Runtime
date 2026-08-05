@@ -367,6 +367,8 @@ FodyWeavers.xsd
 # Build System Files
 /Win64
 /Linux64
+/Web
+/Distribution
 /Libs
 /Dependencies
 /Toolchain

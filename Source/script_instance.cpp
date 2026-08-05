@@ -224,13 +224,32 @@ void CPPScriptInstance::callp_into(const StringName& p_method, const Variant** p
 			return;
 		}
 
-		// Point The Module's Property Globals At This Instance
-		if (!cachedProperties.empty() && !JenovaInterpreter::IsExecutingFunction()) ForcePushProperties();
+		/*
+			Point The Module's Property Globals At This Instance.
+
+			A nested call -- this instance being called from inside another script's call,
+			which is what two objects of the same class talking to each other looks like --
+			has to do the same, and then put the outer instance's pointers back. Skipping the
+			push left the inner script reading and writing the outer instance's properties.
+
+			Only the nested case pays for saving them; the common top-level call is one store
+			per property, as before.
+		*/
+		const bool nestedCall = JenovaInterpreter::IsExecutingFunction();
+		std::vector<void*> outerPropertyPointers;
+		if (!cachedProperties.empty())
+		{
+			if (nestedCall) SavePropertyPointers(outerPropertyPointers);
+			ForcePushProperties();
+		}
 
 		// Invoke Function & Call. The result goes straight into the Variant the engine
 		// supplied; a void script function leaves it untouched, which is the NIL the engine
 		// already put there.
 		JenovaInterpreter::CallFunctionByHandleInto(jenovaMethod, this->owner, this, p_args, p_argument_count, r_return);
+
+		// Hand the module's property globals back to the instance we interrupted.
+		if (nestedCall && !cachedProperties.empty()) RestorePropertyPointers(outerPropertyPointers);
 
 		// The script wrote into this instance's own storage, so the instanceProperties
 		// mirror is only marked stale here and refreshed when something reads it.
@@ -622,7 +641,7 @@ void CPPScriptInstance::SyncPropertyMirror() const
 	propertyMirrorIsStale = false;
 	for (const PropertyBinding& binding : cachedProperties)
 	{
-		jenova::GetVariantFromPropertyPointer(binding.storage, *binding.slot, binding.slot->get_type());
+		jenova::GetVariantFromPropertyPointer(binding.storage, *binding.slot, binding.slot->get_type(), binding.typeName);
 	}
 }
 void CPPScriptInstance::RebuildCallCache() const
@@ -703,6 +722,25 @@ bool CPPScriptInstance::ForcePushProperties()
 
 	// All Good
 	return true;
+}
+void CPPScriptInstance::SavePropertyPointers(std::vector<void*>& savedPointers) const
+{
+	// Whatever the module's property globals currently hold, which is the storage of the
+	// instance whose call this one is nested inside.
+	savedPointers.clear();
+	savedPointers.reserve(cachedProperties.size());
+	for (const PropertyBinding& binding : cachedProperties) savedPointers.push_back(*(void**)binding.address);
+}
+void CPPScriptInstance::RestorePropertyPointers(const std::vector<void*>& savedPointers) const
+{
+	const bool memoryCopy = JenovaInterpreter::GetPropertySetMethod() == jenova::PropertySetMethod::MemoryCopy;
+	for (size_t i = 0; i < cachedProperties.size() && i < savedPointers.size(); i++)
+	{
+		const jenova::PropertyAddress address = cachedProperties[i].address;
+		void* previousPointer = savedPointers[i];
+		if (memoryCopy) memcpy((void*)address, &previousPointer, sizeof(previousPointer));
+		else *(void**)address = previousPointer;
+	}
 }
 bool CPPScriptInstance::ForcePullProperties()
 {

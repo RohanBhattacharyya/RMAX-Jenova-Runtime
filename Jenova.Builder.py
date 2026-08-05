@@ -124,6 +124,7 @@ def get_toolchain_name(buildMode):
     if buildMode == "win-clang": return "mingw-llvm"
     if buildMode == "linux-clang": return "llvm"
     if buildMode == "linux-gcc": return "gnu"
+    if buildMode == "web-emcc": return "emcc"
 def print_banner():
     banner = r"""
 ===========================================================================
@@ -168,10 +169,9 @@ def get_compiler_choice():
     else:
         rgb_print("#e02626", "[ x ] Error : Invalid Choice.")
         exit(-1)
-def generate_gdsdk(output_dir):
+def generate_gdsdk(output_dir, source_sdk_path = "./Libs/GodotSDK", package_name = "GodotSDK", library = ("libgodotcpp-static-x86_64", "libGodot.x64")):
     rgb_print("#367fff", "[ ^ ] Generating GodotSDK Package...")
-    source_sdk_path = "./Libs/GodotSDK"
-    target_sdk_path = os.path.join(output_dir, "GodotSDK")
+    target_sdk_path = os.path.join(output_dir, package_name)
 
     if os.path.exists(target_sdk_path):
         shutil.rmtree(target_sdk_path)
@@ -195,10 +195,10 @@ def generate_gdsdk(output_dir):
         os.rename(old_folder, new_folder)
 
     for ext in [".lib", ".a"]:
-        lib_name = f"libgodotcpp-static-x86_64{ext}"
+        lib_name = f"{library[0]}{ext}"
         src_lib_path = os.path.join("./Libs", lib_name)
         if os.path.exists(src_lib_path):
-            dst_lib_name = f"libGodot.x64{ext}"
+            dst_lib_name = f"{library[1]}{ext}"
             dst_lib_path = os.path.join(target_sdk_path, dst_lib_name)
             shutil.copy2(src_lib_path, dst_lib_path)
 
@@ -330,6 +330,10 @@ def create_distribution_package(package_files, output_archive):
             dst_path = file['dst']
             if os.path.exists(src_path):
                 file_name = os.path.basename(src_path)
+                if os.path.isdir(src_path):
+                    rgb_print("#764be3", f"[ * ] Packing Directory {file_name}...")
+                    archive.writeall(src_path, os.path.join(dst_path, file_name))
+                    continue
                 if file_name != ".gitignore": rgb_print("#764be3", f"[ * ] Packing File {file_name}...")
                 archive.write(src_path, os.path.join(dst_path, file_name))
 
@@ -550,6 +554,120 @@ def build_dependencies_linux(buildMode, cacheDir):
         shutil.copyfile(buildPath + "/gen/include/gdextension_interface.h", sdkPath + "/gdextension_interface.h")
         shutil.copytree(buildPath + "/gen/include", sdkPath, dirs_exist_ok=True)
         rgb_print("#38f227", "[ √ ] Jenova Runtime Dependency 'GodotSDK' Compiled Successfully.")
+
+def build_web(buildMode, buildSystem):
+
+    # Verbose Build
+    rgb_print("#fff06e", f"[ > ] Building Jenova Runtime for Web using {buildSystem} Toolchain...")
+
+    # Resolve Emscripten
+    emcc = shutil.which("em++") or "/usr/lib/emscripten/em++"
+    if not os.path.isfile(emcc):
+        rgb_print("#e02626", "[ x ] Error : Emscripten (em++) not found.")
+        exit(1)
+
+    outputDir = "Web"
+    cacheDir = f"{outputDir}/Cache"
+    webSdkDir = "./Libs/GodotSDK-Web"
+    outputName = "Jenova.Runtime.Web.wasm"
+    godotcppLib = "./Libs/libgodotcpp-static-wasm32.a"
+
+    os.makedirs(cacheDir, exist_ok=True)
+
+    """
+    Build GodotSDK for WebAssembly.
+
+    The headers must be the ones generated for wasm32, not the desktop set in
+    Libs/GodotSDK. Godot's opaque types are sized per target: a StringName is 4 bytes on
+    wasm32 and 8 on x86-64. Mixing them shifts every member offset in godot-cpp's own
+    structures, and the result is not a crash but silent corruption.
+    """
+    if not os.path.exists(godotcppLib) or not os.path.isdir(webSdkDir):
+        rgb_print("#367fff", "[ ^ ] Building GodotSDK for WebAssembly...")
+        buildPath = os.path.abspath(cacheDir + "/Dependencies/godotcpp")
+        subprocess.run([shutil.which("emcmake") or "/usr/lib/emscripten/emcmake", "cmake",
+            "-S", "./Dependencies/libgodot", "-B", buildPath, "-G", "Ninja",
+            "-DCMAKE_BUILD_TYPE=MinSizeRel", "-DGODOTCPP_TARGET=template_release",
+            "-DGODOTCPP_THREADS=OFF", "-DGODOTCPP_USE_HOT_RELOAD=ON", "-DBUILD_SHARED_LIBS=OFF"], check=True)
+        build_with_ninja(buildPath)
+        shutil.copyfile(buildPath + "/bin/libgodot-cpp.web.template_release.wasm32.nothreads.a", godotcppLib)
+
+        if os.path.isdir(webSdkDir): shutil.rmtree(webSdkDir)
+        os.makedirs(webSdkDir, exist_ok=True)
+        shutil.copytree("./Dependencies/libgodot/include", webSdkDir, dirs_exist_ok=True)
+        shutil.copytree(buildPath + "/gen/include", webSdkDir, dirs_exist_ok=True)
+        shutil.copyfile(buildPath + "/gen/include/gdextension_interface.h", webSdkDir + "/gdextension_interface.h")
+        rgb_print("#38f227", "[ √ ] Jenova Runtime Dependency 'GodotSDK' Compiled Successfully.")
+
+    # Compile Sources. AsmJIT and TinyCC are absent by design: both are x86 code
+    # generators, and the Web build runs the Direct interpreter backend instead.
+    # zlib is the one third-party dependency the Web build actually needs: the module
+    # database is zlib-compressed and is decompressed at startup. Emscripten ships a port.
+    # Native WebAssembly exception handling, self-contained inside this module. The
+    # JavaScript-based lowering would need glue that Godot's Web template does not ship.
+    compileFlags = ["-std=c++20", "-Oz", "-fPIC", "-w", "-c", "-sUSE_ZLIB=1", "-fwasm-exceptions"]
+    compileFlags += [f"-D{flag}" for flag in flags]
+    compileFlags += [f"-I{directory}" for directory in directories if not directory.startswith("Libs/GodotSDK")]
+    compileFlags += [f"-I{webSdkDir}", f"-I{webSdkDir}/godot_cpp"]
+    rgb_print("#367fff", "[ ^ ] Compiling Jenova Runtime Source Code...")
+    objectFiles = []
+    with ThreadPoolExecutor() as executor:
+        futures = {}
+        # web_stubs.cpp resolves the libcurl/libarchive symbols the Web build cannot provide.
+        for source in sources + ["Source/web_stubs.cpp"]:
+            objectFile = f"{cacheDir}/{os.path.splitext(os.path.basename(source))[0]}.o"
+            objectFiles.append(objectFile)
+            futures[executor.submit(subprocess.run, [emcc, *compileFlags, source, "-o", objectFile],
+                capture_output=True, text=True)] = source
+        for future in futures:
+            outcome = future.result()
+            if outcome.returncode != 0:
+                rgb_print("#e02626", f"[ x ] Source File '{os.path.basename(futures[future])}' Failed to Compile :\n{outcome.stderr}")
+                exit(1)
+    rgb_print("#38f227", "[ √ ] Jenova Runtime Source Code Compiled.")
+
+    # Link As A Side Module. Godot's Web export template must be the dlink build, which is
+    # the main module that resolves this one's imports at load time.
+    rgb_print("#367fff", "[ ^ ] Linking Jenova Runtime Binary...")
+    # A side module links no system libraries by default, so zlib is passed explicitly: the
+    # module database is zlib-compressed and Godot's own copy is not exported to us.
+    zlibArchive = os.path.expanduser("~/.cache/emscripten/sysroot/lib/wasm32-emscripten/pic/libz.a")
+    if not os.path.isfile(zlibArchive):
+        subprocess.run([shutil.which("embuilder") or "/usr/lib/emscripten/embuilder", "build", "zlib", "--pic"], check=True)
+    linkResult = subprocess.run([emcc, "-Oz", "-sSIDE_MODULE=1", "-sWASM_BIGINT", "-fPIC", "-fwasm-exceptions",
+        *objectFiles, godotcppLib, zlibArchive, "-o", f"{outputDir}/{outputName}"], capture_output=True, text=True)
+    if linkResult.returncode != 0:
+        rgb_print("#e02626", f"[ x ] Failed to Link Jenova Runtime :\n{linkResult.stderr}")
+        exit(1)
+    rgb_print("#38f227", "[ √ ] All Object Files Linked Successfully.")
+
+    # Prepare Release
+    sdkDir = f"{outputDir}/JenovaSDK"
+    os.makedirs(sdkDir, exist_ok=True)
+    open(f"{sdkDir}/.gitignore", "w").write("*")
+    shutil.copy2("./Source/JenovaSDK.h", f"{sdkDir}/JenovaSDK.h")
+    shutil.copy2("./Jenova.Runtime.gdextension", f"{outputDir}/Jenova.Runtime.gdextension")
+
+    # Generate The Script-Facing SDK. Scripts include <Godot/...>, and it has to be the
+    # wasm32 header set for the same reason the runtime does.
+    # Scripts link godot-cpp themselves, exactly as they do on desktop with libGodot.x64.a.
+    # The runtime is loaded first and globally, so its copies of the GDExtension interface
+    # pointers take precedence over the ones a script module brings along.
+    generate_gdsdk(outputDir, webSdkDir, "GodotSDK-Web", ("libgodotcpp-static-wasm32", "libGodot.wasm32"))
+
+    # Create Package
+    if skip_packaging: return
+    packageFiles = [
+        {"src": f"{outputDir}/{outputName}", "dst": "./Jenova"},
+        {"src": f"{outputDir}/Jenova.Runtime.gdextension", "dst": "./Jenova"},
+        {"src": f"{sdkDir}/JenovaSDK.h", "dst": "./Jenova/JenovaSDK"},
+        {"src": f"{sdkDir}/.gitignore", "dst": "./Jenova/JenovaSDK"},
+        {"src": f"{outputDir}/GodotSDK-Web", "dst": "./Jenova/Packages"},
+        {"src": "./Tools/Jenova.WebPacker.py", "dst": "./Jenova/Tools"}
+    ]
+    os.makedirs(f"{outputDir}/Distribution", exist_ok=True)
+    create_distribution_package(packageFiles, f"{outputDir}/Distribution/Jenova-Framework-Web-emcc.7z")
+
 def build_linux(compilerBinary, linkerBinary, buildMode, buildSystem):
 
     # Verbose Build
@@ -1451,6 +1569,83 @@ def build_windows(compilerBinary, linkerBinary, buildMode, buildSystem):
     toolchainName = get_toolchain_name(buildMode)
     create_distribution_package(packageFiles, f"{outputDir}/Distribution/Jenova-Framework-Win64-{toolchainName}.7z")
 
+def create_unified_distribution():
+    """
+    Merge the per-platform build outputs into one package.
+
+    A project that carries this can be moved between Linux and Windows and can export to
+    Windows, Linux and the Web, because everything each platform needs travels with it:
+    all three runtime binaries, one .gdextension that names all of them, the SDK headers,
+    and both GodotSDK packages (x86-64 for desktop scripts, wasm32 for Web ones).
+
+    Runtimes are only built by their own platform's toolchain, so this collects whatever is
+    present and says plainly what is not. Building the Windows runtime needs a Windows
+    machine; the Linux and Web ones can both be produced here.
+    """
+    rgb_print("#367fff", "[ ^ ] Creating Unified Distribution Package...")
+
+    packageFiles = []
+    included, missing = [], []
+
+    def take(sourcePath, destination, platformName = None, required = True):
+        if os.path.exists(sourcePath):
+            packageFiles.append({"src": sourcePath, "dst": destination})
+            if platformName: included.append(platformName)
+            return True
+        if platformName and required: missing.append(platformName)
+        return False
+
+    # Runtime Binaries
+    take("./Win64/Jenova.Runtime.Win64.dll", "./Jenova", "Windows x64")
+    take("./Linux64/Jenova.Runtime.Linux64.so", "./Jenova", "Linux x64")
+    take("./Web/Jenova.Runtime.Web.wasm", "./Jenova", "Web (WebAssembly)")
+
+    # Shared Files. One .gdextension names every platform's binary, so the same project
+    # file works everywhere.
+    take("./Jenova.Runtime.gdextension", "./Jenova")
+    take("./Source/JenovaSDK.h", "./Jenova/JenovaSDK")
+    for sdkLibrary in ["Jenova.SDK.x64.lib", "Jenova.SDK.x64.a"]:
+        take(f"./Win64/JenovaSDK/{sdkLibrary}", "./Jenova/JenovaSDK", required = False)
+
+    # GodotSDK Packages. Scripts are compiled against these, and the desktop and Web ones
+    # are not interchangeable: Godot's opaque types are sized by pointer width.
+    distributionDir = "./Distribution"
+    if os.path.isdir("./Libs/GodotSDK"):
+        generate_gdsdk(distributionDir, "./Libs/GodotSDK", "GodotSDK-Base")
+        take(f"{distributionDir}/GodotSDK-Base", "./Jenova/Packages")
+    else:
+        missing.append("GodotSDK-Base (build for a desktop platform first)")
+    if os.path.isdir("./Libs/GodotSDK-Web"):
+        generate_gdsdk(distributionDir, "./Libs/GodotSDK-Web", "GodotSDK-Web", ("libgodotcpp-static-wasm32", "libGodot.wasm32"))
+        take(f"{distributionDir}/GodotSDK-Web", "./Jenova/Packages")
+    else:
+        missing.append("GodotSDK-Web (build with --compiler web-emcc first)")
+
+    # Web Script Packer. Invoked by the export plugin when exporting for the Web.
+    take("./Tools/Jenova.WebPacker.py", "./Jenova/Tools")
+
+    # Manifest, so the contents of a package are answerable without unpacking it.
+    os.makedirs(distributionDir, exist_ok=True)
+    manifestPath = f"{distributionDir}/Jenova.Distribution.json"
+    with open(manifestPath, "w", encoding="utf-8") as manifest:
+        json.dump({
+            "Version": ".".join(str(part) for part in [0, 3, 9, 9]),
+            "Platforms": included,
+            "Missing": missing,
+            "Generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }, manifest, indent=4)
+    take(manifestPath, "./Jenova")
+
+    if not included:
+        rgb_print("#e02626", "[ x ] Error : Nothing to Package. Build At Least One Platform First.")
+        exit(1)
+    for platformName in missing:
+        rgb_print("#f59b42", f"[ ! ] Not Included : {platformName}")
+
+    os.makedirs(distributionDir, exist_ok=True)
+    create_distribution_package(packageFiles, f"{distributionDir}/Jenova-Framework-AllInOne.7z")
+    rgb_print("#38f227", f"[ √ ] Unified Distribution Contains : {', '.join(included)}")
+
 # Entrypoint
 if __name__ == "__main__":
     # Disable PyCache
@@ -1471,6 +1666,7 @@ if __name__ == "__main__":
     parser.add_argument('--clean-up', action='store_true', help='Clean Up Build Files')
     parser.add_argument('--deep-clean-up', action='store_true', help='Clean Up Everything')
     parser.add_argument('--generate-gdsdk', action='store_true', help='Generate GodotSDK Package')
+    parser.add_argument('--create-distribution', action='store_true', help='Merge Built Platforms Into One Portable Package')
     parser.add_argument('--protected-mode', action='store_true', help='Build Jenova Runtime in Protected Mode')
     parser.add_argument('--enable-blade', action='store_true', help='Build Jenova Runtime featuring Blade Language')
     parser.add_argument('--lithium-edition', action='store_true', help='Build Jenova Runtime for Lithium IDE')
@@ -1505,6 +1701,11 @@ if __name__ == "__main__":
 
     # Skip Source Caching
     if args.skip_packaging: skip_packaging = True   
+
+    # Create Unified Distribution
+    if args.create_distribution:
+        create_unified_distribution()
+        exit(0)
 
     # Clean Up
     if args.clean_up:
@@ -1545,6 +1746,8 @@ if __name__ == "__main__":
             build_linux("clang++", "clang++", "linux-clang", "LLVM Clang")
         elif args.compiler == "linux-gcc":
             build_linux("g++", "g++", "linux-gcc", "GNU Compiler Collection")
+        elif args.compiler == "web-emcc":
+            build_web("web-emcc", "Emscripten")
         else:
             rgb_print("#e02626", "[ x ] Error : Invalid Input.")
             exit(-1)

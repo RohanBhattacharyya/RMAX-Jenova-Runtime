@@ -18,12 +18,15 @@
 // Jenova Loader
 #include "Jenova.Loader.h"
 
-// AsmJIT
+// AsmJIT and TinyCC both emit x86 machine code, so neither exists on WebAssembly. The
+// Direct backend is what runs there, and it generates nothing.
+#ifndef TARGET_PLATFORM_WEB
 #define ASMJIT_STATIC
 #include <AsmJIT/asmjit.h>
-
-// Tiny C Compiler
 #include <TinyCC/libtcc.h>
+#else
+typedef struct TCCState TCCState;
+#endif
 
 // Thunk Cache
 #include <algorithm>
@@ -74,6 +77,133 @@ namespace jenova
         return declaredType == "godot::Variant&" || declaredType == "godot::Variant*" || declaredType == "godot::Variant";
     }
 
+    /*
+        Direct Backend
+        --------------
+        Both JIT backends emit x86 machine code, which cannot exist on WebAssembly: a call
+        there must go through a function pointer whose WASM type index matches the callee
+        exactly. So this backend generates nothing and instead reconstructs the C++ type of
+        the call, letting the compiler emit the right call for whatever target it is built
+        for. It is what the Web platform uses, and it works everywhere else too.
+
+        The parameter type is taken from the script's *declared* signature rather than the
+        Variant that arrives, because the declared type is what the callee's ABI is built
+        from. Passing an INT Variant to an `int` parameter as `long long` happens to work on
+        x86-64 (same register, low half) but is a hard signature mismatch on WASM.
+    */
+    enum class DirectParameterKind : uint8_t { Pointer, Int32, Int64, Double };
+    constexpr size_t MaxDirectParameters = 4;
+
+    static DirectParameterKind ResolveDirectParameterKind(const std::string& declaredType)
+    {
+        if (declaredType.find('*') != std::string::npos || declaredType.find('&') != std::string::npos) return DirectParameterKind::Pointer;
+
+        // Shares the classifier the return path uses, so the two cannot disagree about what
+        // a spelling means. `int64_t` used to reach none of these and was passed as 32 bits.
+        const std::string scalarType = jenova::NormalizeScalarTypeName(declaredType);
+        if (scalarType == "double" || scalarType == "float") return DirectParameterKind::Double;
+        if (scalarType == "int64" || scalarType == "uint64") return DirectParameterKind::Int64;
+        if (scalarType == "int32" || scalarType == "uint32" || scalarType == "bool") return DirectParameterKind::Int32;
+
+        // Anything else is a by-value type the marshaller hands over as a pointer.
+        return DirectParameterKind::Pointer;
+    }
+
+    // Peels one declared parameter per step, accumulating it into the call's type. The
+    // compiler instantiates every combination up to MaxDirectParameters, so no code has to
+    // be generated at run time.
+    template <typename Ret, typename... Args>
+    static Ret InvokeDirect(void* functionAddress, const DirectParameterKind* parameterKinds, const uint64_t* argumentSlots,
+                            size_t index, size_t parameterCount, Args... args)
+    {
+        if (index >= parameterCount) return reinterpret_cast<Ret(*)(Args...)>(functionAddress)(args...);
+        if constexpr (sizeof...(Args) < MaxDirectParameters)
+        {
+            switch (parameterKinds[index])
+            {
+                case DirectParameterKind::Double:
+                    return InvokeDirect<Ret>(functionAddress, parameterKinds, argumentSlots, index + 1, parameterCount, args..., *reinterpret_cast<const double*>(argumentSlots + index));
+                case DirectParameterKind::Int64:
+                    return InvokeDirect<Ret>(functionAddress, parameterKinds, argumentSlots, index + 1, parameterCount, args..., *reinterpret_cast<const long long*>(argumentSlots + index));
+                case DirectParameterKind::Int32:
+                    return InvokeDirect<Ret>(functionAddress, parameterKinds, argumentSlots, index + 1, parameterCount, args..., *reinterpret_cast<const int*>(argumentSlots + index));
+                default:
+                    return InvokeDirect<Ret>(functionAddress, parameterKinds, argumentSlots, index + 1, parameterCount, args..., *reinterpret_cast<void* const*>(argumentSlots + index));
+            }
+        }
+        return Ret();
+    }
+
+    // Rebuilds the return type as well, then hands the raw value to the same converter the
+    // JIT backends use. Returns false when the signature is outside what can be rebuilt.
+    static bool CallDirect(void* functionAddress, const std::string& returnType, const std::string& resolvedReturnType,
+                           bool callMustReturn, const DirectParameterKind* parameterKinds, const uint64_t* argumentSlots,
+                           size_t parameterCount, godot::Variant& r_return)
+    {
+        if (parameterCount > MaxDirectParameters) return false;
+
+        if (!callMustReturn)
+        {
+            InvokeDirect<void>(functionAddress, parameterKinds, argumentSlots, 0, parameterCount);
+            return true;
+        }
+
+        /*
+            A type too large for a register comes back through a hidden pointer argument.
+
+            What the callee constructs there is its own declared type, which is only a
+            Variant when the script actually returned one. Treating a returned String as a
+            Variant read a type tag out of that object's bytes and crashed, so the buffer is
+            handed to the same converter the JIT thunk uses and it decides how to read it.
+        */
+        if (resolvedReturnType == "Variant")
+        {
+            if (parameterCount + 1 > MaxDirectParameters) return false;
+
+            // Sized for the largest type a script can return by value (Projection, at 64
+            // bytes) rather than for a Variant, which is smaller than several of them.
+            alignas(16) unsigned char returnBuffer[64] = {};
+            static_assert(sizeof(godot::Variant) <= sizeof(returnBuffer), "Return buffer no longer fits a Variant.");
+
+            InvokeDirect<void>(functionAddress, parameterKinds, argumentSlots, 0, parameterCount, returnBuffer);
+
+            godot::Variant* converted = jenova::MakeVariantFromReturnType(reinterpret_cast<godot::Variant*>(returnBuffer), returnType.c_str());
+            if (!converted) return false;
+            r_return = *converted;
+            delete converted;
+            return true;
+        }
+
+        // Scalar returns land in a zeroed 8-byte cell, wide enough for any of them.
+        // MakeVariantFromReturnType reads it back at the declared width and allocates its
+        // result, same as on the JIT paths, so it is freed here.
+        uint64_t returnCell = 0;
+
+        #define JENOVA_DIRECT_SCALAR(typeString, type)                                                                  \
+            if (resolvedReturnType == typeString) *reinterpret_cast<type*>(&returnCell) =                                \
+                InvokeDirect<type>(functionAddress, parameterKinds, argumentSlots, 0, parameterCount); else
+
+        // These are the C type names ResolveReturnTypeForJIT emits, and they have to stay in
+        // step with it: an unmatched name refuses the call rather than guessing a width.
+        JENOVA_DIRECT_SCALAR("double", double)
+        JENOVA_DIRECT_SCALAR("float", float)
+        JENOVA_DIRECT_SCALAR("int", int)
+        JENOVA_DIRECT_SCALAR("unsigned int", unsigned int)
+        JENOVA_DIRECT_SCALAR("unsigned char", unsigned char)
+        JENOVA_DIRECT_SCALAR("long long", long long)
+        JENOVA_DIRECT_SCALAR("unsigned long long", unsigned long long)
+        JENOVA_DIRECT_SCALAR("void*", void*)
+        return false;
+
+        #undef JENOVA_DIRECT_SCALAR
+
+        godot::Variant* converted = jenova::MakeVariantFromReturnType(reinterpret_cast<godot::Variant*>(&returnCell), returnType.c_str());
+        if (!converted) return false;
+        r_return = *converted;
+        delete converted;
+        return true;
+    }
+
     // Mirrors ResolveVariantValueAsString's dispatch, so the C type declared in the thunk
     // always matches the value the marshaller writes into the argument slot. The declared
     // type is classified once at resolve time; comparing type name strings per argument
@@ -110,8 +240,10 @@ namespace jenova
         std::string                     scriptUID;
         jenova::FunctionAddress         functionAddress   = 0;
         std::string                     returnType;
+        std::string                     resolvedReturnType;       // C type name the backends rebuild the call with
         jenova::ParameterTypeList       parameterTypes;
         std::vector<uint8_t>            declaredAsVariant;        // per Godot parameter, precomputed from parameterTypes
+        std::vector<DirectParameterKind> directParameterKinds;    // per declared parameter, for the Direct backend
         bool                            callMustReturn    = false;
         bool                            callHasParameters = false;
         bool                            needsPassingOwner = false;
@@ -143,10 +275,12 @@ namespace jenova
         {
             for (auto& functionEntry : scriptEntry.second)
             {
+                #ifndef TARGET_PLATFORM_WEB
                 for (auto& thunk : functionEntry.second.thunks)
                 {
                     if (thunk.compilerState) tcc_delete(thunk.compilerState);
                 }
+                #endif
             }
         }
         interpreterFunctionCache.clear();
@@ -282,9 +416,12 @@ bool JenovaInterpreter::LoadModule(const uint8_t* moduleDataPtr, size_t moduleSi
     }
     if (!moduleHandle) return false;
 
-    // Get Module Base Address
+    // Get Module Base Address. A WebAssembly side module has none to report: its symbols
+    // are resolved by name, so zero is the expected answer rather than a failure.
     moduleBaseAddress = JenovaLoader::GetModuleBaseAddress(moduleHandle);
+    #ifndef TARGET_PLATFORM_WEB
     if (!moduleBaseAddress) return false;
+    #endif
 
     // Build Metadata Cache if Enabled
     if (jenova::GlobalSettings::CacheInterpreterMetadata)
@@ -730,6 +867,10 @@ void* JenovaInterpreter::ResolveFunctionHandle(const std::string& functionName, 
     resolvedMetadata.returnType = JenovaInterpreter::GetFunctionReturn(functionName, scriptUID);
     if (resolvedMetadata.returnType == "Unknown") return abandon();
 
+    // Resolved once. It is a pure function of the declared type, and working it out per
+    // call meant string matching on every returning call into a script.
+    resolvedMetadata.resolvedReturnType = jenova::ResolveReturnTypeForJIT(resolvedMetadata.returnType);
+
     resolvedMetadata.parameterTypes = JenovaInterpreter::GetFunctionParameters(functionName, scriptUID);
     if (resolvedMetadata.parameterTypes.size() == 0) return abandon();
 
@@ -742,6 +883,10 @@ void* JenovaInterpreter::ResolveFunctionHandle(const std::string& functionName, 
     for (size_t i = resolvedMetadata.parameterOffset; i < resolvedMetadata.parameterTypes.size(); i++)
     {
         resolvedMetadata.declaredAsVariant.push_back(jenova::IsVariantDeclaredType(resolvedMetadata.parameterTypes[i]) ? 1 : 0);
+    }
+    if (resolvedMetadata.callHasParameters)
+    {
+        for (const std::string& parameterType : resolvedMetadata.parameterTypes) resolvedMetadata.directParameterKinds.push_back(jenova::ResolveDirectParameterKind(parameterType));
     }
 
     // Report script signatures the active backend cannot call correctly, instead of
@@ -762,9 +907,14 @@ void JenovaInterpreter::CallFunctionByHandleInto(void* functionHandle, const god
     const std::string& functionName = functionMetadata->functionName;
     const std::string& scriptUID = functionMetadata->scriptUID;
 
-    // Validate Module
+    // Validate Module. A WebAssembly side module reports no base address, so only the
+    // handle says whether a module is loaded there.
     if (!allowExecution) { r_return = GenerateFunctionCallError(functionName, "ERROR::EXECUTION_DENIED"); return; }
+    #ifdef TARGET_PLATFORM_WEB
+    if (!moduleHandle) { r_return = GenerateFunctionCallError(functionName, "ERROR::INVALID_MODULE"); return; }
+    #else
     if (!moduleHandle || !moduleBaseAddress) { r_return = GenerateFunctionCallError(functionName, "ERROR::INVALID_MODULE"); return; }
+    #endif
 
     // Verbose
     jenova::VerboseByID(__LINE__, "Interpreter Calling Function [%s] From Script [%s] On Object [%p]", functionName.c_str(), scriptUID.c_str(), objectPtr);
@@ -790,6 +940,70 @@ void JenovaInterpreter::CallFunctionByHandleInto(void* functionHandle, const god
     jenova::ScriptCaller scriptCaller(objectPtr, instance);
 
     // Generate Code And Call Using Backends
+    if (interpreterBackend == jenova::InterpreterBackend::Direct)
+    {
+        // Marshal by the *declared* type, so the call the compiler emits matches the
+        // callee. Slots start zeroed: a narrow value is written at the low end and read
+        // back at its declared width.
+        uint64_t argumentSlots[jenova::MaxDirectParameters] = {};
+        jenova::PointerList ptrList;
+        size_t slotIndex = 0;
+        const size_t declaredCount = functionMetadata->directParameterKinds.size();
+
+        // Refuse a signature that does not fit, rather than calling it with the surplus
+        // arguments dropped: the callee would read whatever those registers happened to
+        // hold. Use a JIT backend for functions that take more than this.
+        if (totalParameterCount > jenova::MaxDirectParameters)
+        {
+            r_return = GenerateFunctionCallError(functionName, "ERROR::SIGNATURE_NOT_SUPPORTED_BY_DIRECT_BACKEND");
+            return;
+        }
+
+        if (needsPassingOwner) *reinterpret_cast<void**>(&argumentSlots[slotIndex++]) = &scriptCaller;
+        if (callHasParameters)
+        {
+            for (int i = 0; i < functionParametersCount && slotIndex < jenova::MaxDirectParameters; i++)
+            {
+                const Variant* parameterValue = functionParameters[i];
+                switch (slotIndex < declaredCount ? functionMetadata->directParameterKinds[slotIndex] : jenova::DirectParameterKind::Pointer)
+                {
+                    case jenova::DirectParameterKind::Double:
+                        *reinterpret_cast<double*>(&argumentSlots[slotIndex]) = double(*parameterValue);
+                        break;
+                    case jenova::DirectParameterKind::Int64:
+                    case jenova::DirectParameterKind::Int32:
+                        *reinterpret_cast<int64_t*>(&argumentSlots[slotIndex]) = int64_t(*parameterValue);
+                        break;
+                    default:
+                        if (size_t(i) < functionMetadata->declaredAsVariant.size() && functionMetadata->declaredAsVariant[i] != 0)
+                        {
+                            *reinterpret_cast<const void**>(&argumentSlots[slotIndex]) = parameterValue;
+                        }
+                        else
+                        {
+                            std::string resolvedValue = jenova::ResolveVariantValueAsString(parameterValue, functionParametersType[i + parameterOffset], ptrList);
+                            size_t addressOffset = resolvedValue.find("0x");
+                            *reinterpret_cast<void**>(&argumentSlots[slotIndex]) = addressOffset == std::string::npos ? nullptr :
+                                reinterpret_cast<void*>(strtoull(resolvedValue.c_str() + addressOffset + 2, nullptr, 16));
+                        }
+                        break;
+                }
+                slotIndex++;
+            }
+        }
+
+        SetExecutionState(true);
+        const bool called = jenova::CallDirect(reinterpret_cast<void*>(functionAddress), functionReturnType,
+            functionMetadata->resolvedReturnType, callMustReturn,
+            functionMetadata->directParameterKinds.data(), argumentSlots, slotIndex, r_return);
+        SetExecutionState(false);
+
+        for (void* ptr : ptrList) if (ptr) delete ptr;
+        if (!called) { r_return = GenerateFunctionCallError(functionName, "ERROR::SIGNATURE_NOT_SUPPORTED_BY_DIRECT_BACKEND"); }
+        return;
+    }
+    // Both JIT backends are x86 code generators and cannot exist on WebAssembly.
+    #ifndef TARGET_PLATFORM_WEB
     if (interpreterBackend == jenova::InterpreterBackend::AsmJIT)
     {
         // Final Parameter List. Only this backend needs it: the TinyCC thunk reads the
@@ -1212,6 +1426,7 @@ void JenovaInterpreter::CallFunctionByHandleInto(void* functionHandle, const god
         }
         return;
     }
+    #endif
     if (interpreterBackend == jenova::InterpreterBackend::LibFFI)
     {
         // Not Implemented Yet
@@ -2249,6 +2464,12 @@ bool JenovaInterpreter::UpdateConfigurationsFromMetaData(const jenova::Serialize
             SetInterpreterBackend(moduleMetaData["InterpreterBackend"].get<jenova::InterpreterBackend>());
         }
 
+        // WebAssembly has no way to run generated machine code, so both JIT backends are
+        // unavailable there regardless of what the module was built with.
+        #ifdef TARGET_PLATFORM_WEB
+        SetInterpreterBackend(jenova::InterpreterBackend::Direct);
+        #endif
+
         // Set Profiling Mode
         if (moduleMetaData.contains("ProfilingMode"))
         {
@@ -2365,9 +2586,26 @@ bool JenovaInterpreter::BuildMetadataCache()
                     // Add to Function List
                     scriptCache.functionNames.push_back(functionName);
 
-                    // Get Function Offset and Calculate Address
-                    jenova::FunctionAddress functionOffset = func.value()["Offset"].get<jenova::FunctionAddress>();
-                    scriptCache.functionAddresses[functionName] = moduleBaseAddress + functionOffset;
+                    /*
+                        Get Function Address.
+
+                        A module built for WebAssembly carries symbol names instead of
+                        offsets: there is no load address to add an offset to, and the
+                        dynamic linker is the only thing that knows where a side module's
+                        code ended up. Resolving it here keeps every later lookup identical
+                        to the offset-based platforms.
+                    */
+                    if (func.value().contains("Symbol"))
+                    {
+                        void* symbolAddress = JenovaLoader::GetVirtualFunction(moduleHandle, func.value()["Symbol"].get<std::string>().c_str());
+                        if (!symbolAddress) jenova::Warning("Jenova Interpreter", "Unable to Resolve Symbol for Function `%s`.", functionName.c_str());
+                        scriptCache.functionAddresses[functionName] = jenova::FunctionAddress(symbolAddress);
+                    }
+                    else
+                    {
+                        jenova::FunctionAddress functionOffset = func.value()["Offset"].get<jenova::FunctionAddress>();
+                        scriptCache.functionAddresses[functionName] = moduleBaseAddress + functionOffset;
+                    }
 
                     // Get Function Parameters
                     jenova::ParameterTypeList parameterTypes;
@@ -2392,9 +2630,18 @@ bool JenovaInterpreter::BuildMetadataCache()
                     // Add to Property List
                     scriptCache.propertyNames.push_back(propertyName);
 
-                    // Get Property Offset & Calculate Address
-                    jenova::PropertyAddress propertyOffset = prop.value()["Offset"].get<jenova::PropertyAddress>();
-                    scriptCache.propertyAddresses[propertyName] = moduleBaseAddress + propertyOffset;
+                    // Get Property Address. Symbol name on WebAssembly, offset elsewhere.
+                    if (prop.value().contains("Symbol"))
+                    {
+                        void* symbolAddress = JenovaLoader::GetVirtualFunction(moduleHandle, prop.value()["Symbol"].get<std::string>().c_str());
+                        if (!symbolAddress) jenova::Warning("Jenova Interpreter", "Unable to Resolve Symbol for Property `%s`.", propertyName.c_str());
+                        scriptCache.propertyAddresses[propertyName] = jenova::PropertyAddress(symbolAddress);
+                    }
+                    else
+                    {
+                        jenova::PropertyAddress propertyOffset = prop.value()["Offset"].get<jenova::PropertyAddress>();
+                        scriptCache.propertyAddresses[propertyName] = moduleBaseAddress + propertyOffset;
+                    }
 
                     // Get Property Type
                     scriptCache.propertyTypes[propertyName] = prop.value()["Type"].get<std::string>();

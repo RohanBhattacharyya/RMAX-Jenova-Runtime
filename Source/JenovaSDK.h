@@ -14,6 +14,15 @@
 
 #pragma once
 
+/*
+	A script's generated proxy defines `self` as a macro for its property accessor, and the
+	user's #include of this header sits after that definition. The macro would rewrite this
+	header's own uses of the name, so it is set aside for the duration of the header and put
+	back afterwards. GCC tolerated the rewriting by accident; Clang and Emscripten do not.
+*/
+#pragma push_macro("self")
+#undef self
+
 // Enable Jenova SDK
 #define JENOVA_SDK
 
@@ -834,3 +843,5 @@ namespace jenova::sdk
 	bool UnregisterBootEvent(jenova::sdk::FunctionPtr funcionPtr);
 	bool UnregisterShutdownEvent(jenova::sdk::FunctionPtr funcionPtr);
 }
+
+#pragma pop_macro("self")

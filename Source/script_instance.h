@@ -70,7 +70,16 @@ private:
 		uint64_t	nameKey = 0;			// StringName's interned pointer bits
 		void*		handle  = nullptr;		// interpreter function handle
 	};
-	static uint64_t MethodNameKey(const StringName& methodName) { return *reinterpret_cast<const uint64_t*>(&methodName); }
+	static uint64_t MethodNameKey(const StringName& methodName)
+	{
+		// Exactly one StringName wide: it is pointer sized, which is 4 bytes on wasm32 and
+		// 8 on a 64-bit target. Reading a fixed 8 would pull in neighbouring memory and no
+		// two keys would ever match.
+		static_assert(sizeof(StringName) <= sizeof(uint64_t), "StringName no longer fits a key.");
+		uint64_t nameKey = 0;
+		memcpy(&nameKey, &methodName, sizeof(StringName));
+		return nameKey;
+	}
 	void* FindMethodHandle(const StringName& methodName) const
 	{
 		const uint64_t nameKey = MethodNameKey(methodName);
@@ -88,6 +97,8 @@ private:
 		RebuildCallCache();
 	}
 	void RebuildCallCache() const;
+	void SavePropertyPointers(std::vector<void*>& savedPointers) const;
+	void RestorePropertyPointers(const std::vector<void*>& savedPointers) const;
 	void CallInternalMethod(const StringName& p_method, GDExtensionCallError& r_error, Variant& r_return);
 	void ReleaseCachedProperties() const;
 	void SyncPropertyMirror() const;

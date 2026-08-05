@@ -25,7 +25,11 @@
 #include "Curl/curl.h"
 
 // Tiny C Compiler
+// Clektron compiles its scripts with TinyCC, which is an x86 code generator. There is
+// nothing to generate code into on WebAssembly, so the engine reports unavailable there.
+#ifndef TARGET_PLATFORM_WEB
 #include <TinyCC/libtcc.h>
+#endif
 
 // Macros
 #define UnreferenceParameter(P) (void)(P)
@@ -904,6 +908,10 @@ Clektron::Clektron() {}
 Clektron::~Clektron() {}
 bool Clektron::ExecuteScript(const std::string& ctronScriptContent, bool noEntrypoint)
 {
+#ifdef TARGET_PLATFORM_WEB
+    jenova::Error("Clektron Script Engine", "Clektron is not available on the Web platform.");
+    return false;
+#else
     // Validate Script Content
     if (ctronScriptContent.empty())
     {
@@ -1164,6 +1172,7 @@ bool Clektron::ExecuteScript(const std::string& ctronScriptContent, bool noEntry
 
     // Return Result
     return result;
+#endif
 }
 bool Clektron::ExecuteScript(const godot::String& ctronScriptContent, bool noEntrypoint)
 {

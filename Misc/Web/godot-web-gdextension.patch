@@ -1,0 +1,32 @@
+diff --git a/platform/web/SCsub b/platform/web/SCsub
+index c5c068093c..2ed7be4350 100644
+--- a/platform/web/SCsub
++++ b/platform/web/SCsub
+@@ -87,6 +87,11 @@ if env["dlink_enabled"]:
+     sys_env.Append(CCFLAGS=["-s", "MAIN_MODULE=1"])
+     sys_env.Append(LINKFLAGS=["-s", "MAIN_MODULE=1"])
+     sys_env.Append(LINKFLAGS=["-s", "EXPORT_ALL=1"])
++    # Native WebAssembly exception handling, so the main runtime defines and exports the
++    # __cpp_exception tag. A GDExtension that throws cannot be instantiated without it, and
++    # the tag has to come from the main module because side modules import it.
++    sys_env.Append(CCFLAGS=["-fwasm-exceptions"])
++    sys_env.Append(LINKFLAGS=["-fwasm-exceptions"])
+     sys_env.Append(LINKFLAGS=["-s", "WARN_ON_UNDEFINED_SYMBOLS=0"])
+     sys_env["CCFLAGS"].remove("-fvisibility=hidden")
+     sys_env["LINKFLAGS"].remove("-fvisibility=hidden")
+diff --git a/platform/web/os_web.cpp b/platform/web/os_web.cpp
+index b3e8784a40..be4f3088dd 100644
+--- a/platform/web/os_web.cpp
++++ b/platform/web/os_web.cpp
+@@ -276,7 +276,10 @@ bool OS_Web::is_userfs_persistent() const {
+ 
+ Error OS_Web::open_dynamic_library(const String &p_path, void *&p_library_handle, GDExtensionData *p_data) {
+ 	String path = p_path.get_file();
+-	p_library_handle = dlopen(path.utf8().get_data(), RTLD_NOW);
++	// RTLD_GLOBAL so an extension that loads side modules of its own can resolve against
++	// it. Without it the extension's symbols stay private to its own handle, and anything
++	// it dlopens later fails to link.
++	p_library_handle = dlopen(path.utf8().get_data(), RTLD_NOW | RTLD_GLOBAL);
+ 	ERR_FAIL_NULL_V_MSG(p_library_handle, ERR_CANT_OPEN, vformat("Can't open dynamic library: %s. Error: %s.", p_path, dlerror()));
+ 
+ 	if (p_data != nullptr && p_data->r_resolved_path != nullptr) {
