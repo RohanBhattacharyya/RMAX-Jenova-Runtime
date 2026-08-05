@@ -1,5 +1,5 @@
 <picture>
-<img style="width: 100%; height: auto; display: block;" alt="RMAX-Jenova-Framework-Banner" src="https://github.com/user-attachments/assets/c853df68-0d8b-4ff9-a18b-745516656a2d" />
+<img style="width: 100%; height: auto; display: block;" alt="RMAX-Jenova-Framework-Banner" src="https://github.com/user-attachments/assets/3ef59121-c49c-4f6b-8736-439ff1bbd8bd" />
 </picture>
 
 # Jenova Runtime (Core)
