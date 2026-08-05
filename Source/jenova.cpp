@@ -9143,6 +9143,70 @@ namespace jenova
 		// Default Case [Material, Animation etc.]
 		return new Variant();
 	}
+	void FreeVariantBasedProperty(void* propertyPointer, const std::string& typeName)
+	{
+		// Counterpart of AllocateVariantBasedProperty. `delete` on a void* would skip the
+		// destructor, which leaks the heap buffer behind String, Array, Dictionary and the
+		// packed arrays, so the pointer has to be typed back first.
+		if (!propertyPointer) return;
+
+		// Clean Type Name
+		std::string typeNameCleaned = typeName;
+		CleanVariantTypeName(typeNameCleaned);
+
+		#define JENOVA_FREE_PROPERTY_AS(typeString, type) if (typeNameCleaned == typeString) { delete static_cast<type*>(propertyPointer); return; }
+
+		// Atomic types
+		JENOVA_FREE_PROPERTY_AS("bool", bool);
+		if (typeNameCleaned == "int" || typeNameCleaned == "int32_t" || typeNameCleaned == "int64_t") { delete static_cast<int64_t*>(propertyPointer); return; }
+		if (typeNameCleaned == "double" || typeNameCleaned == "float") { delete static_cast<double*>(propertyPointer); return; }
+		JENOVA_FREE_PROPERTY_AS("String", godot::String);
+
+		// Math types
+		JENOVA_FREE_PROPERTY_AS("Vector2", godot::Vector2);
+		JENOVA_FREE_PROPERTY_AS("Vector2i", godot::Vector2i);
+		JENOVA_FREE_PROPERTY_AS("Rect2", godot::Rect2);
+		JENOVA_FREE_PROPERTY_AS("Rect2i", godot::Rect2i);
+		JENOVA_FREE_PROPERTY_AS("Vector3", godot::Vector3);
+		JENOVA_FREE_PROPERTY_AS("Vector3i", godot::Vector3i);
+		JENOVA_FREE_PROPERTY_AS("Transform2D", godot::Transform2D);
+		JENOVA_FREE_PROPERTY_AS("Vector4", godot::Vector4);
+		JENOVA_FREE_PROPERTY_AS("Vector4i", godot::Vector4i);
+		JENOVA_FREE_PROPERTY_AS("Plane", godot::Plane);
+		JENOVA_FREE_PROPERTY_AS("Quaternion", godot::Quaternion);
+		JENOVA_FREE_PROPERTY_AS("AABB", godot::AABB);
+		JENOVA_FREE_PROPERTY_AS("Basis", godot::Basis);
+		JENOVA_FREE_PROPERTY_AS("Transform3D", godot::Transform3D);
+		JENOVA_FREE_PROPERTY_AS("Projection", godot::Projection);
+
+		// Misc types
+		JENOVA_FREE_PROPERTY_AS("Color", godot::Color);
+		JENOVA_FREE_PROPERTY_AS("StringName", godot::StringName);
+		JENOVA_FREE_PROPERTY_AS("NodePath", godot::NodePath);
+		JENOVA_FREE_PROPERTY_AS("RID", godot::RID);
+		JENOVA_FREE_PROPERTY_AS("Object", Variant);
+		JENOVA_FREE_PROPERTY_AS("Callable", godot::Callable);
+		JENOVA_FREE_PROPERTY_AS("Signal", godot::Signal);
+		JENOVA_FREE_PROPERTY_AS("Dictionary", godot::Dictionary);
+		JENOVA_FREE_PROPERTY_AS("Array", godot::Array);
+
+		// Typed arrays
+		JENOVA_FREE_PROPERTY_AS("PackedByteArray", godot::PackedByteArray);
+		JENOVA_FREE_PROPERTY_AS("PackedInt32Array", godot::PackedInt32Array);
+		JENOVA_FREE_PROPERTY_AS("PackedInt64Array", godot::PackedInt64Array);
+		JENOVA_FREE_PROPERTY_AS("PackedFloat32Array", godot::PackedFloat32Array);
+		JENOVA_FREE_PROPERTY_AS("PackedFloat64Array", godot::PackedFloat64Array);
+		JENOVA_FREE_PROPERTY_AS("PackedStringArray", godot::PackedStringArray);
+		JENOVA_FREE_PROPERTY_AS("PackedVector2Array", godot::PackedVector2Array);
+		JENOVA_FREE_PROPERTY_AS("PackedVector3Array", godot::PackedVector3Array);
+		JENOVA_FREE_PROPERTY_AS("PackedColorArray", godot::PackedColorArray);
+		JENOVA_FREE_PROPERTY_AS("PackedVector4Array", godot::PackedVector4Array);
+
+		#undef JENOVA_FREE_PROPERTY_AS
+
+		// Default Case [Material, Animation etc.]
+		delete static_cast<Variant*>(propertyPointer);
+	}
 	bool SetPropertyPointerValueFromVariant(jenova::PropertyPointer propertyPointer, const Variant& variantValue)
 	{
 		// Get Property Information

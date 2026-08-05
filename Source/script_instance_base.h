@@ -53,6 +53,17 @@ namespace jenova
 		virtual bool has_method(const StringName& p_method) const = 0;
 		virtual int get_method_argument_count(const StringName& p_method, bool* r_is_valid = nullptr) const = 0;
 		virtual Variant callp(const StringName& p_method, const Variant** p_args, int p_argcount, GDExtensionCallError& r_error) = 0;
+
+		/*
+			The engine hands the call a Variant to put the result in, already constructed and
+			NIL. Returning by value instead meant constructing a second Variant, moving it in
+			and destroying it on every single script call, and most script callbacks return
+			nothing at all. Implementations that care override this; the rest keep callp().
+		*/
+		virtual void callp_into(const StringName& p_method, const Variant** p_args, int p_argcount, GDExtensionCallError& r_error, Variant& r_return)
+		{
+			r_return = callp(p_method, p_args, p_argcount, r_error);
+		}
 		virtual void notification(int p_notification, bool p_reversed) = 0;
 		virtual String to_string(bool* r_valid) = 0;
 		virtual void refcount_incremented() = 0;

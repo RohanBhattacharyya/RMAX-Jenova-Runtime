@@ -25,8 +25,167 @@
 // Tiny C Compiler
 #include <TinyCC/libtcc.h>
 
+// Thunk Cache
+#include <algorithm>
+#include <unordered_map>
+#include <unordered_set>
+#include <mutex>
+#include <atomic>
+
 // Helper Macros
 #define RESOLVE_PARAMETER(index) JenovaInterpreter::GetResolvedParameterPointer(objectPtr, functionParameters[index], functionParametersType[index + parameterOffset])
+
+/*
+    Interpreter Thunk Cache
+    -----------------------
+    The TinyCC backend used to generate, compile, relocate and destroy a call thunk on
+    every single script function invocation. It had to, because the argument *values*
+    were baked into the generated source as immediates:
+
+        function_t _func = (function_t)0x7f...;
+        _func((void*)0x7ffd..., 0.016666);
+
+    New values every call means new code every call, so `_physics_process` ran the whole
+    TinyCC front-end 60 times a second per script instance.
+
+    The generated thunk now receives an argument array instead of immediates, so it
+    depends only on (function address, argument type signature) and is compiled once and
+    reused. Only the cheap marshalling of values into the argument slots happens per call.
+*/
+namespace jenova
+{
+    // Parameter kinds are compared per call to pick a cached thunk, so they are a plain
+    // enum rather than std::string. Comparing type names would allocate on every call.
+    enum class ThunkParameterKind : uint8_t { Pointer, Double, Int64, Bool };
+
+    static const char* ThunkParameterKindToCType(ThunkParameterKind parameterKind)
+    {
+        switch (parameterKind)
+        {
+            case ThunkParameterKind::Double:  return "double";
+            case ThunkParameterKind::Int64:   return "long long int";
+            case ThunkParameterKind::Bool:    return "bool";
+            default:                          return "void*";
+        }
+    }
+
+    static bool IsVariantDeclaredType(const std::string& declaredType)
+    {
+        return declaredType == "godot::Variant&" || declaredType == "godot::Variant*" || declaredType == "godot::Variant";
+    }
+
+    // Mirrors ResolveVariantValueAsString's dispatch, so the C type declared in the thunk
+    // always matches the value the marshaller writes into the argument slot. The declared
+    // type is classified once at resolve time; comparing type name strings per argument
+    // per call was a measurable share of the cost of calling a script.
+    static ThunkParameterKind ResolveThunkParameterKind(const godot::Variant* variantValue, bool declaredAsVariant)
+    {
+        if (declaredAsVariant) return ThunkParameterKind::Pointer;
+        switch (variantValue->get_type())
+        {
+            case godot::Variant::BOOL:  return ThunkParameterKind::Bool;
+            case godot::Variant::FLOAT: return ThunkParameterKind::Double;
+            case godot::Variant::INT:   return ThunkParameterKind::Int64;
+            default:                    return ThunkParameterKind::Pointer;
+        }
+    }
+
+    struct InterpreterThunk
+    {
+        TCCState*                       compilerState = nullptr;  // owns the relocated code, must outlive `entry`
+        void*                           entry         = nullptr;  // void* (*)(void**)
+        std::vector<ThunkParameterKind> parameterKinds;
+    };
+
+    /*
+        Everything about a script function that does not change between calls. Previously
+        each call re-fetched the address, the return type (returned by value as a string)
+        and the parameter type list (returned by value as a vector<string>), then built a
+        cache key by string concatenation. That was several heap allocations per call
+        before any work happened. It is all resolved once now and reused by pointer.
+    */
+    struct InterpreterFunctionMetadata
+    {
+        std::string                     functionName;
+        std::string                     scriptUID;
+        jenova::FunctionAddress         functionAddress   = 0;
+        std::string                     returnType;
+        jenova::ParameterTypeList       parameterTypes;
+        std::vector<uint8_t>            declaredAsVariant;        // per Godot parameter, precomputed from parameterTypes
+        bool                            callMustReturn    = false;
+        bool                            callHasParameters = false;
+        bool                            needsPassingOwner = false;
+        int                             parameterOffset   = 0;
+        std::vector<InterpreterThunk>   thunks;                   // one per argument type signature, almost always one
+
+        /*
+            A script function is called with the same argument types every time in practice,
+            so the first compiled thunk is published here and read without taking the cache
+            lock. A published thunk is never mutated or freed while the module is loaded, so
+            an acquire load of the pointer is enough to use it.
+        */
+        std::atomic<void*>              primaryThunkEntry { nullptr };
+        std::vector<ThunkParameterKind> primaryThunkKinds;
+    };
+
+    // Keyed script-then-function so no key string is ever built at call time.
+    // unordered_map keeps references to elements valid across inserts, so the pointer
+    // handed back stays good once the lock is released.
+    static std::unordered_map<std::string, std::unordered_map<std::string, InterpreterFunctionMetadata>> interpreterFunctionCache;
+    static std::unordered_set<std::string> interpreterSignatureWarnings;
+    static std::mutex interpreterCacheMutex;
+
+    // Function addresses are module-relative, so every cached entry dies with the module.
+    void ClearInterpreterThunkCache()
+    {
+        std::lock_guard<std::mutex> cacheLock(interpreterCacheMutex);
+        for (auto& scriptEntry : interpreterFunctionCache)
+        {
+            for (auto& functionEntry : scriptEntry.second)
+            {
+                for (auto& thunk : functionEntry.second.thunks)
+                {
+                    if (thunk.compilerState) tcc_delete(thunk.compilerState);
+                }
+            }
+        }
+        interpreterFunctionCache.clear();
+        interpreterSignatureWarnings.clear();
+    }
+
+    /*
+        The AsmJIT backend emits integer-register moves only (there is not a single xmm
+        reference in its code path), so a script function declaring a float or double
+        parameter receives that argument in rsi/rdx instead of xmm0 and silently computes
+        with garbage. That produced NaN positions rather than any diagnostic. Report it.
+    */
+    static void ValidateBackendSignature(jenova::InterpreterBackend backend, const std::string& functionName,
+                                         const std::string& scriptUID, const jenova::ParameterTypeList& parameterTypes)
+    {
+        if (backend != jenova::InterpreterBackend::AsmJIT) return;
+
+        for (const std::string& parameterType : parameterTypes)
+        {
+            if (parameterType != "float" && parameterType != "double") continue;
+
+            std::string warningKey = scriptUID + "::" + functionName + "::" + parameterType;
+            {
+                std::lock_guard<std::mutex> cacheLock(interpreterCacheMutex);
+                if (!interpreterSignatureWarnings.insert(warningKey).second) return;
+            }
+
+            jenova::Error("Interpreter Backend",
+                "Function `%s` declares a `%s` parameter, but the NitroJIT (AsmJIT) backend passes every "
+                "argument in an integer register. This argument will arrive as garbage and the function "
+                "will silently compute incorrect results.\n"
+                "Use the NitroJIT script convention (`Variant&` parameters) for this function, or switch "
+                "`jenova/interpreter_backend` to TinyCC and restart the editor.\n"
+                "Script : %s",
+                functionName.c_str(), parameterType.c_str(), scriptUID.c_str());
+            return;
+        }
+    }
+}
 
 // Jenova Interpreter Implementation :: Boot
 void JenovaInterpreter::BootInterpreter()
@@ -176,8 +335,19 @@ bool JenovaInterpreter::LoadModule(const uint8_t* moduleDataPtr, size_t moduleSi
     // Enable Execution
     allowExecution = true;
 
+    // Invalidate Everything Cached Against The Previous Module.
+    moduleGeneration++;
+
     // All Good
 	return true;
+}
+uint64_t JenovaInterpreter::GetModuleGeneration()
+{
+    return moduleGeneration;
+}
+jenova::PropertySetMethod JenovaInterpreter::GetPropertySetMethod()
+{
+    return propertySetMethod;
 }
 bool JenovaInterpreter::LoadModule(const jenova::BuildResult& buildResult)
 {
@@ -203,6 +373,13 @@ bool JenovaInterpreter::UnloadModule(const jenova::ModuleUnloadStage& unloadStag
     // Adjust Agressive Mode [Disable For All For Now]
     bool aggressiveMode = unloadStage == jenova::ModuleUnloadStage::UnloadModuleToShutdown ? true : !(QUERY_ENGINE_MODE(Editor) || QUERY_ENGINE_MODE(Debug) || QUERY_ENGINE_MODE(Runtime));
     JenovaLoader::SetAgressiveMode(aggressiveMode);
+
+    // Drop Cached Thunks. They bake module-relative function addresses, so every one of
+    // them dangles the moment the module goes away.
+    jenova::ClearInterpreterThunkCache();
+
+    // Invalidate Everything Cached Against This Module (script instance call caches).
+    moduleGeneration++;
 
     // Flush Property Storage
     if (!JenovaInterpreter::FlushPropertyStorage())
@@ -528,57 +705,108 @@ jenova::ScriptPropertyContainer JenovaInterpreter::GetPropertyContainer(const st
         return CreatePropertyContainer(scriptUID);
     }
 }
+void* JenovaInterpreter::ResolveFunctionHandle(const std::string& functionName, const std::string& scriptUID)
+{
+    /*
+        Address, return type and parameter type list are fixed for the lifetime of the
+        module, so they are resolved once and the caller holds on to the result. Callers
+        used to pay a mutex and two string-keyed hash lookups on every single call just to
+        find this again.
+    */
+    std::lock_guard<std::mutex> cacheLock(jenova::interpreterCacheMutex);
+    auto& scriptFunctions = jenova::interpreterFunctionCache[scriptUID];
+    auto cachedFunction = scriptFunctions.find(functionName);
+    if (cachedFunction != scriptFunctions.end()) return &cachedFunction->second;
+
+    // Built in place: the entry holds an atomic, so it is not movable into the map.
+    jenova::InterpreterFunctionMetadata& resolvedMetadata = scriptFunctions[functionName];
+    auto abandon = [&]() -> void* { scriptFunctions.erase(functionName); return nullptr; };
+
+    resolvedMetadata.functionName = functionName;
+    resolvedMetadata.scriptUID = scriptUID;
+    resolvedMetadata.functionAddress = JenovaInterpreter::GetFunctionAddress(functionName, scriptUID);
+    if (!resolvedMetadata.functionAddress) return abandon();
+
+    resolvedMetadata.returnType = JenovaInterpreter::GetFunctionReturn(functionName, scriptUID);
+    if (resolvedMetadata.returnType == "Unknown") return abandon();
+
+    resolvedMetadata.parameterTypes = JenovaInterpreter::GetFunctionParameters(functionName, scriptUID);
+    if (resolvedMetadata.parameterTypes.size() == 0) return abandon();
+
+    resolvedMetadata.callMustReturn = JenovaInterpreter::IsFunctionReturnable(resolvedMetadata.returnType);
+    resolvedMetadata.callHasParameters = !(resolvedMetadata.parameterTypes.size() == 1 && resolvedMetadata.parameterTypes[0] == "void");
+    resolvedMetadata.needsPassingOwner = resolvedMetadata.parameterTypes[0] == "jenova::sdk::Caller*";
+    resolvedMetadata.parameterOffset = resolvedMetadata.needsPassingOwner ? 1 : 0;
+
+    // Classify declared parameter types once, so no type name is string-compared per call.
+    for (size_t i = resolvedMetadata.parameterOffset; i < resolvedMetadata.parameterTypes.size(); i++)
+    {
+        resolvedMetadata.declaredAsVariant.push_back(jenova::IsVariantDeclaredType(resolvedMetadata.parameterTypes[i]) ? 1 : 0);
+    }
+
+    // Report script signatures the active backend cannot call correctly, instead of
+    // letting the call proceed and produce silent garbage. Once per function.
+    jenova::ValidateBackendSignature(interpreterBackend, functionName, scriptUID, resolvedMetadata.parameterTypes);
+
+    return &resolvedMetadata;
+}
 Variant JenovaInterpreter::CallFunction(const godot::Object* objectPtr, void* instance, const std::string& functionName, std::string& scriptUID, const Variant** functionParameters, const int functionParametersCount)
 {
+    void* functionHandle = ResolveFunctionHandle(functionName, scriptUID);
+    if (!functionHandle) return GenerateFunctionCallError(functionName, "ERROR::FUNCTION_RESOLVE_FAILED");
+    return CallFunctionByHandle(functionHandle, objectPtr, instance, functionParameters, functionParametersCount);
+}
+void JenovaInterpreter::CallFunctionByHandleInto(void* functionHandle, const godot::Object* objectPtr, void* instance, const Variant** functionParameters, const int functionParametersCount, Variant& r_return)
+{
+    jenova::InterpreterFunctionMetadata* functionMetadata = static_cast<jenova::InterpreterFunctionMetadata*>(functionHandle);
+    const std::string& functionName = functionMetadata->functionName;
+    const std::string& scriptUID = functionMetadata->scriptUID;
+
     // Validate Module
-    if (!allowExecution) return GenerateFunctionCallError(functionName, "ERROR::EXECUTION_DENIED");
-    if (!moduleHandle || !moduleBaseAddress) return GenerateFunctionCallError(functionName, "ERROR::INVALID_MODULE");
+    if (!allowExecution) { r_return = GenerateFunctionCallError(functionName, "ERROR::EXECUTION_DENIED"); return; }
+    if (!moduleHandle || !moduleBaseAddress) { r_return = GenerateFunctionCallError(functionName, "ERROR::INVALID_MODULE"); return; }
 
     // Verbose
     jenova::VerboseByID(__LINE__, "Interpreter Calling Function [%s] From Script [%s] On Object [%p]", functionName.c_str(), scriptUID.c_str(), objectPtr);
 
-    // Get Script Path
-    std::string scriptPath = "";
-    if (JenovaProfiler::IsEnabled()) scriptPath = GetScriptPath(scriptUID);
+    const jenova::FunctionAddress functionAddress = functionMetadata->functionAddress;
+    const std::string& functionReturnType = functionMetadata->returnType;
+    const jenova::ParameterTypeList& functionParametersType = functionMetadata->parameterTypes;
+    const bool callMustReturn = functionMetadata->callMustReturn;
+    const bool callHasParameters = functionMetadata->callHasParameters;
+    const bool needsPassingOwner = functionMetadata->needsPassingOwner;
+    const int parameterOffset = functionMetadata->parameterOffset;
 
-    // Get Function Address Offset
-    jenova::FunctionAddress functionAddress = JenovaInterpreter::GetFunctionAddress(functionName, scriptUID);
-    if (!functionAddress) return GenerateFunctionCallError(functionName, "ERROR::FUNCTION_ADDRESS_NOT_FOUND");
+    // Get Script Path. Only the profiler wants it, and building it unconditionally put a
+    // std::string on the stack of every script call.
+    std::string scriptPath;
+    const bool profilerEnabled = JenovaProfiler::IsEnabled();
+    if (profilerEnabled) scriptPath = GetScriptPath(scriptUID);
 
-    // Get Function Return Type
-    std::string functionReturnType = JenovaInterpreter::GetFunctionReturn(functionName, scriptUID);
-    if (functionReturnType == "Unknown") return GenerateFunctionCallError(functionName, "ERROR::FUNCTION_RETURN_TYPE_NOT_FOUND");
-
-    // Get Function Parameters Type
-    jenova::ParameterTypeList functionParametersType = JenovaInterpreter::GetFunctionParameters(functionName, scriptUID);
-    if (functionParametersType.size() == 0) return GenerateFunctionCallError(functionName, "ERROR::FUNCTION_PARAMETERS_TYPE_NOT_FOUND");
-
-    // Determine and Set Flags
-    bool callMustReturn = JenovaInterpreter::IsFunctionReturnable(functionReturnType);
-    bool callHasParameters = !(functionParametersType.size() == 1 && functionParametersType[0] == "void");
-    bool needsPassingOwner = functionParametersType[0] == "jenova::sdk::Caller*";
-
-    // Create Final Parameter List
-    std::vector<uintptr_t> resolvedParameters;
-
-    // Pass Owner
-    std::shared_ptr<jenova::ScriptCaller> scriptHandle = nullptr;
-    if (needsPassingOwner)
-    {
-        scriptHandle = std::make_shared<jenova::ScriptCaller>(objectPtr, instance);
-        resolvedParameters.push_back(reinterpret_cast<uintptr_t>(scriptHandle.get()));
-    }
-
-    // Add Godot Parameters
-    int parameterOffset = needsPassingOwner ? 1 : 0;
-    for (size_t i = 0; i < functionParametersCount; i++) resolvedParameters.push_back(RESOLVE_PARAMETER(i));
-
-    // Calculate Final Size
-    int resolvedParametersCount = callHasParameters ? resolvedParameters.size() : 0;
+    // Pass Owner. Stack allocated. Same lifetime it had as a shared_ptr, and scripts only
+    // read through it for the duration of the call.
+    constexpr size_t InlineParameterCapacity = 16;
+    const size_t totalParameterCount = size_t(functionParametersCount) + (needsPassingOwner ? 1 : 0);
+    jenova::ScriptCaller scriptCaller(objectPtr, instance);
 
     // Generate Code And Call Using Backends
     if (interpreterBackend == jenova::InterpreterBackend::AsmJIT)
     {
+        // Final Parameter List. Only this backend needs it: the TinyCC thunk reads the
+        // Variants itself, so building this for it was pure waste on every call.
+        uintptr_t inlineResolvedParameters[InlineParameterCapacity];
+        std::vector<uintptr_t> overflowResolvedParameters;
+        uintptr_t* resolvedParameters = inlineResolvedParameters;
+        if (totalParameterCount > InlineParameterCapacity)
+        {
+            overflowResolvedParameters.resize(totalParameterCount);
+            resolvedParameters = overflowResolvedParameters.data();
+        }
+        size_t writtenParameterCount = 0;
+        if (needsPassingOwner) resolvedParameters[writtenParameterCount++] = reinterpret_cast<uintptr_t>(&scriptCaller);
+        for (int i = 0; i < functionParametersCount; i++) resolvedParameters[writtenParameterCount++] = RESOLVE_PARAMETER(i);
+        const int resolvedParametersCount = callHasParameters ? int(writtenParameterCount) : 0;
+
         try
         {
             // Create a JIT Runtime
@@ -661,7 +889,7 @@ Variant JenovaInterpreter::CallFunction(const godot::Object* objectPtr, void* in
 
                 // Call the JIT-generated Function
                 Variant result = Variant::NIL;
-                if (JenovaProfiler::IsEnabled())
+                if (profilerEnabled)
                 {
                     if (!JenovaInterpreter::IsExecutingFunction()) JenovaProfiler::SetCurrentExecutionContext(scriptPath, functionName);
                     JenovaTinyProfiler::CreateCheckpoint("NitroJITExecution");
@@ -682,8 +910,8 @@ Variant JenovaInterpreter::CallFunction(const godot::Object* objectPtr, void* in
                 jitRuntime.release(callerFunction);
 
                 // Return the Result as a Variant
-                if (result.get_type() == Variant::NIL) return Variant("RESULT::VOID");
-                return result;
+                if (result.get_type() == Variant::NIL) { r_return = Variant("RESULT::VOID"); return; }
+                { r_return = result; return; }
             }
             else
             {
@@ -691,7 +919,7 @@ Variant JenovaInterpreter::CallFunction(const godot::Object* objectPtr, void* in
                 typedef void(*CallerFunction)();
                 CallerFunction callerFunction = nullptr;
                 jitRuntime.add(&callerFunction, &code);
-                if (JenovaProfiler::IsEnabled())
+                if (profilerEnabled)
                 {
                     if (!JenovaInterpreter::IsExecutingFunction()) JenovaProfiler::SetCurrentExecutionContext(scriptPath, functionName);
                     JenovaTinyProfiler::CreateCheckpoint(GenerateFunctionUniqueID(scriptPath, functionName));
@@ -708,114 +936,255 @@ Variant JenovaInterpreter::CallFunction(const godot::Object* objectPtr, void* in
                     SetExecutionState(false);
                 }
                 jitRuntime.release(callerFunction);
-                return Variant(true);
+                // Void call, leave the engine's NIL in place. Same as the TinyCC backend.
+                return;
             }
         }
         catch (const std::exception&)
         {
             // If Failed, Return False
-            return GenerateFunctionCallError(functionName, "ERROR::CALL_FAILED");
+            { r_return = GenerateFunctionCallError(functionName, "ERROR::CALL_FAILED"); return; }
         }
     }
     if (interpreterBackend == jenova::InterpreterBackend::TinyCC)
     {
-        // Create Pointer List
-        jenova::PointerList ptrList;
-        
-        // Generate Caller Code
-        std::string interpreterCallerCode;
-        interpreterCallerCode += jenova::Format("struct Variant { unsigned char opaque[%d]; };\n", GODOT_CPP_VARIANT_SIZE);
-        interpreterCallerCode += "typedef struct Variant Variant;\n";
-        interpreterCallerCode += "Variant* MakeVariant(void*, char*);\n";
-        interpreterCallerCode += "void* interpreter_call()\n";
-        interpreterCallerCode += "{\n";
-        interpreterCallerCode += "typedef " + jenova::ResolveReturnTypeForJIT(functionReturnType) + "(*function_t)(";
-        if (needsPassingOwner) interpreterCallerCode  += "void*";
-        for (int i = 0; i < functionParametersCount; i++)
+        // Classify Arguments. Plain enum, so selecting a cached thunk costs no allocation.
+        jenova::ThunkParameterKind inlineParameterKinds[InlineParameterCapacity];
+        std::vector<jenova::ThunkParameterKind> overflowParameterKinds;
+        jenova::ThunkParameterKind* parameterKinds = inlineParameterKinds;
+        if (totalParameterCount > InlineParameterCapacity)
         {
-            if (i == 0 && needsPassingOwner) interpreterCallerCode += ",";
-            interpreterCallerCode += jenova::ResolveVariantTypeAsString(functionParameters[i]);
-            if (i != functionParametersCount - 1) interpreterCallerCode += ",";
+            overflowParameterKinds.resize(totalParameterCount);
+            parameterKinds = overflowParameterKinds.data();
         }
-        interpreterCallerCode += ");\n";
-        interpreterCallerCode += jenova::Format("function_t _func = (function_t)0x%llx;\n", functionAddress);
-        if (callMustReturn) interpreterCallerCode += jenova::ResolveReturnTypeForJIT(functionReturnType) + " result = ";
-        interpreterCallerCode += "_func(";
-        if (needsPassingOwner) interpreterCallerCode += jenova::Format("(void*)0x%llx", resolvedParameters[0]);
-        for (int i = 0; i < functionParametersCount; i++)
+        size_t parameterKindCount = 0;
+        if (needsPassingOwner) parameterKinds[parameterKindCount++] = jenova::ThunkParameterKind::Pointer;
+        if (callHasParameters)
         {
-            if (i == 0 && needsPassingOwner) interpreterCallerCode += ",";
-            interpreterCallerCode += jenova::ResolveVariantValueAsString(functionParameters[i], functionParametersType[i], ptrList);
-            if (i != functionParametersCount - 1) interpreterCallerCode += ",";
-        }
-        interpreterCallerCode += ");\n";
-        if (callMustReturn) interpreterCallerCode += "return MakeVariant(&result,\"" + functionReturnType + "\");\n";
-        else interpreterCallerCode += "return 0;\n";
-        interpreterCallerCode += "}";
-
-        // Initialize TCC Compiler
-        TCCState* tcc = tcc_new();
-        if (!tcc) 
-        {
-            jenova::Error("Interpreter Backend", "Failed to Initialize JIT Interpreter.");
-            return Variant(false);
-        }
-
-        // Create Error/Warning Reporter 
-        if (jenova::GlobalStorage::DeveloperModeActivated)
-        {
-            jenova::VerboseByID(__LINE__, "JIT Execution Code : \n%s", interpreterCallerCode.c_str());
-            auto tcc_error_handler = [](void* opaque, const char* msg) -> void
+            const size_t declaredCount = functionMetadata->declaredAsVariant.size();
+            for (int i = 0; i < functionParametersCount; i++)
             {
-                jenova::Error("Interpreter Backend", "%s", msg);
-            };
-            tcc_set_error_func(tcc, nullptr, tcc_error_handler);
+                const bool declaredAsVariant = size_t(i) < declaredCount && functionMetadata->declaredAsVariant[i] != 0;
+                parameterKinds[parameterKindCount++] = jenova::ResolveThunkParameterKind(functionParameters[i], declaredAsVariant);
+            }
         }
 
-        // Configure TCC Compiler
-        tcc_set_output_type(tcc, TCC_OUTPUT_MEMORY);
-        tcc_set_options(tcc, "-nostdlib");
-
-        // Add Symbols
-        tcc_add_symbol(tcc, "memmove", reinterpret_cast<const void*>(&jenova::RelocateMemory));
-        tcc_add_symbol(tcc, "MakeVariant", reinterpret_cast<const void*>(&jenova::MakeVariantFromReturnType));
-
-        // Compile Generated Code
-        if (tcc_compile_string(tcc, interpreterCallerCode.c_str()) == -1) 
+        // Select Cached Thunk For This Argument Signature. The signature a function is
+        // called with does not change in practice, so the published thunk is checked first
+        // and taking the cache lock is reserved for the case where it does.
+        void* thunkEntry = functionMetadata->primaryThunkEntry.load(std::memory_order_acquire);
+        if (thunkEntry)
         {
-            jenova::Error("Interpreter Backend", "Failed to Compile Interpreter Code.");
-            for (void* ptr : ptrList) if (ptr) delete ptr;
-            tcc_delete(tcc);
-            return Variant(false);
+            const std::vector<jenova::ThunkParameterKind>& primaryKinds = functionMetadata->primaryThunkKinds;
+            if (primaryKinds.size() != parameterKindCount || !std::equal(primaryKinds.begin(), primaryKinds.end(), parameterKinds)) thunkEntry = nullptr;
         }
-
-        // Prepare For Execution
-        if (tcc_relocate(tcc, TCC_RELOCATE_AUTO) < 0) {
-            jenova::Error("Interpreter Backend", "Failed to Resolve Interpreter Code.");
-            for (void* ptr : ptrList) if (ptr) delete ptr;
-            tcc_delete(tcc);
-            return Variant(false);
-        }
-
-        // Get Compiled Caller Function
-        using MetaCallerType = Variant*(*)();
-        MetaCallerType interpreterCaller = (MetaCallerType)tcc_get_symbol(tcc, "interpreter_call");
-        if (!interpreterCaller) 
+        if (!thunkEntry)
         {
-            jenova::Error("Interpreter Backend", "Failed to Get Interpreter JIT Caller.");
-            for (void* ptr : ptrList) if (ptr) delete ptr;
-            tcc_delete(tcc);
-            return Variant(false);
+            std::lock_guard<std::mutex> cacheLock(jenova::interpreterCacheMutex);
+            for (const jenova::InterpreterThunk& candidateThunk : functionMetadata->thunks)
+            {
+                if (candidateThunk.parameterKinds.size() != parameterKindCount) continue;
+                if (!std::equal(candidateThunk.parameterKinds.begin(), candidateThunk.parameterKinds.end(), parameterKinds)) continue;
+                thunkEntry = candidateThunk.entry;
+                break;
+            }
         }
+
+        // Compile Thunk On First Call For This Signature
+        if (!thunkEntry)
+        {
+            std::string interpreterCallerCode;
+            interpreterCallerCode += jenova::Format("struct Variant { unsigned char opaque[%d]; };\n", GODOT_CPP_VARIANT_SIZE);
+            interpreterCallerCode += "typedef struct Variant Variant;\n";
+            interpreterCallerCode += "Variant* MakeVariant(void*, char*);\n";
+            interpreterCallerCode += "void* interpreter_call(void** args)\n";
+            interpreterCallerCode += "{\n";
+            interpreterCallerCode += "typedef " + jenova::ResolveReturnTypeForJIT(functionReturnType) + "(*function_t)(";
+            for (size_t i = 0; i < parameterKindCount; i++)
+            {
+                if (i != 0) interpreterCallerCode += ",";
+                interpreterCallerCode += jenova::ThunkParameterKindToCType(parameterKinds[i]);
+            }
+            interpreterCallerCode += ");\n";
+            interpreterCallerCode += jenova::Format("function_t _func = (function_t)0x%llx;\n", functionAddress);
+            if (callMustReturn) interpreterCallerCode += jenova::ResolveReturnTypeForJIT(functionReturnType) + " result = ";
+            interpreterCallerCode += "_func(";
+            for (size_t i = 0; i < parameterKindCount; i++)
+            {
+                if (i != 0) interpreterCallerCode += ",";
+                interpreterCallerCode += jenova::Format("*(%s*)args[%d]", jenova::ThunkParameterKindToCType(parameterKinds[i]), int(i));
+            }
+            interpreterCallerCode += ");\n";
+            if (callMustReturn) interpreterCallerCode += "return MakeVariant(&result,\"" + functionReturnType + "\");\n";
+            else interpreterCallerCode += "return 0;\n";
+            interpreterCallerCode += "}";
+
+            // Initialize TCC Compiler
+            TCCState* tcc = tcc_new();
+            if (!tcc)
+            {
+                jenova::Error("Interpreter Backend", "Failed to Initialize JIT Interpreter.");
+                { r_return = Variant(false); return; }
+            }
+
+            // Create Error/Warning Reporter
+            if (jenova::GlobalStorage::DeveloperModeActivated)
+            {
+                jenova::VerboseByID(__LINE__, "JIT Execution Code : \n%s", interpreterCallerCode.c_str());
+                auto tcc_error_handler = [](void* opaque, const char* msg) -> void
+                {
+                    jenova::Error("Interpreter Backend", "%s", msg);
+                };
+                tcc_set_error_func(tcc, nullptr, tcc_error_handler);
+            }
+
+            // Configure TCC Compiler
+            tcc_set_output_type(tcc, TCC_OUTPUT_MEMORY);
+            tcc_set_options(tcc, "-nostdlib");
+
+            // Add Symbols
+            tcc_add_symbol(tcc, "memmove", reinterpret_cast<const void*>(&jenova::RelocateMemory));
+            tcc_add_symbol(tcc, "MakeVariant", reinterpret_cast<const void*>(&jenova::MakeVariantFromReturnType));
+
+            // Compile Generated Code
+            if (tcc_compile_string(tcc, interpreterCallerCode.c_str()) == -1)
+            {
+                jenova::Error("Interpreter Backend", "Failed to Compile Interpreter Code for Function `%s`.", functionName.c_str());
+                tcc_delete(tcc);
+                { r_return = Variant(false); return; }
+            }
+
+            // Prepare For Execution
+            if (tcc_relocate(tcc, TCC_RELOCATE_AUTO) < 0)
+            {
+                jenova::Error("Interpreter Backend", "Failed to Resolve Interpreter Code for Function `%s`.", functionName.c_str());
+                tcc_delete(tcc);
+                { r_return = Variant(false); return; }
+            }
+
+            // Get Compiled Caller Function
+            void* compiledEntry = tcc_get_symbol(tcc, "interpreter_call");
+            if (!compiledEntry)
+            {
+                jenova::Error("Interpreter Backend", "Failed to Get Interpreter JIT Caller for Function `%s`.", functionName.c_str());
+                tcc_delete(tcc);
+                { r_return = Variant(false); return; }
+            }
+
+            // Store Thunk. The TCCState owns the relocated code, so it is kept alive for as
+            // long as it is cached and is only released by ClearInterpreterThunkCache.
+            {
+                std::lock_guard<std::mutex> cacheLock(jenova::interpreterCacheMutex);
+                bool alreadyCompiled = false;
+                for (const jenova::InterpreterThunk& candidateThunk : functionMetadata->thunks)
+                {
+                    if (candidateThunk.parameterKinds.size() != parameterKindCount) continue;
+                    if (!std::equal(candidateThunk.parameterKinds.begin(), candidateThunk.parameterKinds.end(), parameterKinds)) continue;
+                    thunkEntry = candidateThunk.entry;
+                    alreadyCompiled = true;
+                    break;
+                }
+                if (alreadyCompiled)
+                {
+                    // Another thread compiled the same signature first, keep theirs.
+                    tcc_delete(tcc);
+                }
+                else
+                {
+                    jenova::InterpreterThunk newThunk;
+                    newThunk.compilerState = tcc;
+                    newThunk.entry = compiledEntry;
+                    newThunk.parameterKinds.assign(parameterKinds, parameterKinds + parameterKindCount);
+                    functionMetadata->thunks.push_back(std::move(newThunk));
+                    thunkEntry = compiledEntry;
+
+                    // Publish the first signature for the lock-free path. Kinds are written
+                    // before the pointer that guards them becomes visible.
+                    if (!functionMetadata->primaryThunkEntry.load(std::memory_order_relaxed))
+                    {
+                        functionMetadata->primaryThunkKinds.assign(parameterKinds, parameterKinds + parameterKindCount);
+                        functionMetadata->primaryThunkEntry.store(compiledEntry, std::memory_order_release);
+                    }
+                }
+            }
+        }
+
+        // Marshal Arguments Into Slots. One 8-byte slot per parameter, `args[i]` points at it.
+        uint64_t inlineArgumentSlots[InlineParameterCapacity];
+        void* inlineArgumentPointers[InlineParameterCapacity];
+        std::vector<uint64_t> overflowArgumentSlots;
+        std::vector<void*> overflowArgumentPointers;
+        uint64_t* argumentSlots = inlineArgumentSlots;
+        void** argumentPointers = inlineArgumentPointers;
+        if (totalParameterCount > InlineParameterCapacity)
+        {
+            overflowArgumentSlots.resize(totalParameterCount);
+            overflowArgumentPointers.resize(totalParameterCount);
+            argumentSlots = overflowArgumentSlots.data();
+            argumentPointers = overflowArgumentPointers.data();
+        }
+
+        jenova::PointerList ptrList;
+        size_t slotIndex = 0;
+        if (needsPassingOwner)
+        {
+            *reinterpret_cast<void**>(&argumentSlots[slotIndex]) = &scriptCaller;
+            slotIndex++;
+        }
+        if (callHasParameters)
+        {
+            for (int i = 0; i < functionParametersCount; i++)
+            {
+                const Variant* parameterValue = functionParameters[i];
+                const std::string& declaredType = functionParametersType[i + parameterOffset];
+
+                switch (parameterKinds[slotIndex])
+                {
+                    case jenova::ThunkParameterKind::Double:
+                        *reinterpret_cast<double*>(&argumentSlots[slotIndex]) = double(*parameterValue);
+                        break;
+                    case jenova::ThunkParameterKind::Int64:
+                        *reinterpret_cast<long long int*>(&argumentSlots[slotIndex]) = (long long int)int64_t(*parameterValue);
+                        break;
+                    case jenova::ThunkParameterKind::Bool:
+                        *reinterpret_cast<unsigned char*>(&argumentSlots[slotIndex]) = bool(*parameterValue) ? 1 : 0;
+                        break;
+                    default:
+                        if (size_t(i) < functionMetadata->declaredAsVariant.size() && functionMetadata->declaredAsVariant[i] != 0)
+                        {
+                            // Variant parameters are passed straight through, no copy needed.
+                            *reinterpret_cast<const void**>(&argumentSlots[slotIndex]) = reinterpret_cast<const void*>(parameterValue);
+                        }
+                        else
+                        {
+                            // Everything else (Vector3, String, Transform3D, ...) is heap-copied
+                            // and freed after the call. ResolveVariantValueAsString owns that
+                            // dispatch and the ptrList bookkeeping, and always yields
+                            // "(void*)0x<address>" here, so reuse it rather than duplicating
+                            // its ~240 line type switch.
+                            std::string resolvedValue = jenova::ResolveVariantValueAsString(parameterValue, declaredType, ptrList);
+                            size_t addressOffset = resolvedValue.find("0x");
+                            void* resolvedPointer = addressOffset == std::string::npos ? nullptr :
+                                reinterpret_cast<void*>(strtoull(resolvedValue.c_str() + addressOffset + 2, nullptr, 16));
+                            *reinterpret_cast<void**>(&argumentSlots[slotIndex]) = resolvedPointer;
+                        }
+                        break;
+                }
+                slotIndex++;
+            }
+        }
+        for (size_t i = 0; i < parameterKindCount; i++) argumentPointers[i] = &argumentSlots[i];
 
         // Execute Caller
+        using MetaCallerType = Variant*(*)(void**);
+        MetaCallerType interpreterCaller = (MetaCallerType)thunkEntry;
         Variant* result = nullptr;
-        if (JenovaProfiler::IsEnabled())
+        if (profilerEnabled)
         {
             if (!JenovaInterpreter::IsExecutingFunction()) JenovaProfiler::SetCurrentExecutionContext(scriptPath, functionName);
             JenovaTinyProfiler::CreateCheckpoint(GenerateFunctionUniqueID(scriptPath, functionName));
             SetExecutionState(true);
-            result = interpreterCaller();
+            result = interpreterCaller(argumentPointers);
             SetExecutionState(false);
             double executionDuration = JenovaTinyProfiler::GetCheckpointTimeAndDispose(GenerateFunctionUniqueID(scriptPath, functionName));
             JenovaProfiler::AddExecutionRecord(scriptPath, functionName, executionDuration);
@@ -823,16 +1192,13 @@ Variant JenovaInterpreter::CallFunction(const godot::Object* objectPtr, void* in
         else
         {
             SetExecutionState(true);
-            result = interpreterCaller();
+            result = interpreterCaller(argumentPointers);
             SetExecutionState(false);
         }
 
         // Release Allocated Values
         for (void* ptr : ptrList) if (ptr) delete ptr;
         ptrList.clear();
-
-        // Clean up
-        tcc_delete(tcc);
 
         // Process Result
         if (callMustReturn)
@@ -841,10 +1207,10 @@ Variant JenovaInterpreter::CallFunction(const godot::Object* objectPtr, void* in
             {
                 Variant finalResult(*result);
                 delete result;
-                return finalResult;
+                { r_return = finalResult; return; }
             }
         }
-        return Variant(true);
+        return;
     }
     if (interpreterBackend == jenova::InterpreterBackend::LibFFI)
     {
@@ -852,21 +1218,18 @@ Variant JenovaInterpreter::CallFunction(const godot::Object* objectPtr, void* in
     }
 
     // No Valid Backend
-    return GenerateFunctionCallError(functionName, "ERROR::INVALID_INTERPRETER_BACKEND");
+    { r_return = GenerateFunctionCallError(functionName, "ERROR::INVALID_INTERPRETER_BACKEND"); return; }
+}
+Variant JenovaInterpreter::CallFunctionByHandle(void* functionHandle, const godot::Object* objectPtr, void* instance, const Variant** functionParameters, const int functionParametersCount)
+{
+    Variant callResult;
+    CallFunctionByHandleInto(functionHandle, objectPtr, instance, functionParameters, functionParametersCount, callResult);
+    return callResult;
 }
 void JenovaInterpreter::SetExecutionPermission(bool executionPermission)
 {
     // Set Execution Permission
     allowExecution = executionPermission;
-}
-void JenovaInterpreter::SetExecutionState(bool executionState)
-{
-    // Set Execution State
-    isExecuting = executionState;
-}
-bool JenovaInterpreter::IsExecutingFunction()
-{
-    return isExecuting;
 }
 void JenovaInterpreter::AbortExecution()
 {

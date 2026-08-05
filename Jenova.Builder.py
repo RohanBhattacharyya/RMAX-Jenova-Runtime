@@ -363,7 +363,7 @@ def build_dependencies_linux(buildMode, cacheDir):
     os.environ['CXX'] = 'clang++' if buildMode == "linux-clang" else 'g++'
     os.environ['CFLAGS'] = '-fPIC -w -m64'
     os.environ['CXXFLAGS'] = '-std=c++20 -w -fPIC -m64'
-    os.environ['LDFLAGS'] = '-static-libstdc++ -static-libgcc -Wl,-Bstatic -lssl -lcrypto -Wl,-Bdynamic -ldl -lrt -m64'
+    os.environ['LDFLAGS'] = '-static-libstdc++ -static-libgcc -lssl -lcrypto -ldl -lrt -m64'
     os.environ['C_COMPILER'] = 'clang' if buildMode == "linux-clang" else 'gcc'
     os.environ['CXX_COMPILER'] = 'clang++' if buildMode == "linux-clang" else 'g++'
 
@@ -400,8 +400,24 @@ def build_dependencies_linux(buildMode, cacheDir):
             "-G", "Ninja",
             "-DCMAKE_BUILD_TYPE=MinSizeRel",
             "-DBUILD_SHARED_LIBS=OFF",
+
+            # Jenova only needs web downloads, not FTP/SFTP/SCP/etc.
+            "-DHTTP_ONLY=ON",
+
+            # Keep HTTPS support.
+            "-DCURL_USE_OPENSSL=ON",
+
+            # Disable optional system dependencies.
+            "-DCURL_USE_LIBSSH2=OFF",
+            "-DUSE_NGHTTP2=OFF",
+            "-DCURL_USE_LIBPSL=OFF",
+            "-DUSE_LIBIDN2=OFF",
             "-DCURL_BROTLI=OFF",
-            "-DCURL_USE_LIBPSL=OFF"
+            "-DCURL_ZSTD=OFF",
+            "-DCURL_ZLIB=OFF",
+            "-DENABLE_ARES=OFF",
+            "-DCURL_USE_GSSAPI=OFF",
+            "-DCURL_USE_GSASL=OFF"
         ], check=True)
         build_with_ninja(buildPath)
         shutil.copyfile(buildPath + "/lib/libcurl.a", "./Libs/libcurl-static-x86_64.a")
@@ -616,7 +632,7 @@ def build_linux(compilerBinary, linkerBinary, buildMode, buildSystem):
     rgb_print("#367fff", "[ ^ ] Generating Linker Command...")
     link_command = (
         f"{linker} {'-static' if static_build else '-shared'} -fPIC {' '.join(object_files)} -o {outputDir}/{outputName} -m64 "
-        f"-static-libstdc++ -static-libgcc -L/usr/lib64 {' '.join(libs)} -Wl,-Bstatic -lssl -lcrypto -Wl,-Bdynamic -ldl -lrt -lzstd "
+        f"-static-libstdc++ -static-libgcc -L/usr/lib64 {' '.join(libs)} -lssl -lcrypto -ldl -lrt -lzstd "
         f"-Wl,-Map,{outputDir}/{mapFileName}"
     )
 

@@ -32,6 +32,66 @@ protected:
 private:
 	void update_methods() const;
 
+private:
+	/*
+		Per-call fast path.
+
+		callp() used to, on every single engine callback, fetch the script's function list
+		by value, build a StringName per entry to compare against, convert the script UID
+		and the method name to std::string, and push every property through a lookup that
+		concatenated Godot Strings to form its key. At 60 Hz per script instance that
+		dominated the cost of calling into C++.
+
+		None of it changes while the module is loaded, so it is resolved once and keyed on
+		the interpreter's module generation, which bumps on every load/unload.
+	*/
+	struct PropertyBinding
+	{
+		StringName				name;
+		std::string				typeName;
+		jenova::PropertyAddress	address = 0;		// module global holding the property pointer
+		jenova::PropertyPointer	storage = nullptr;	// storage owned by THIS instance
+		Variant*				slot = nullptr;		// mirror inside instanceProperties, for get()/serialization
+	};
+	mutable uint64_t							callCacheGeneration = 0;
+	mutable bool								callCacheValid = false;
+	mutable bool								propertyMirrorIsStale = false;
+	mutable std::string							cachedIdentity;
+	/*
+		Method lookup.
+
+		godot-cpp's StringName comparison and hashing both cross back into the engine, so
+		matching a method name that way cost several engine calls per script call. A
+		StringName is an interned pointer, so its raw bits identify the name: a linear scan
+		of 8-byte keys over the handful of methods a script has needs no engine call at all.
+	*/
+	struct MethodBinding
+	{
+		uint64_t	nameKey = 0;			// StringName's interned pointer bits
+		void*		handle  = nullptr;		// interpreter function handle
+	};
+	static uint64_t MethodNameKey(const StringName& methodName) { return *reinterpret_cast<const uint64_t*>(&methodName); }
+	void* FindMethodHandle(const StringName& methodName) const
+	{
+		const uint64_t nameKey = MethodNameKey(methodName);
+		for (const MethodBinding& binding : cachedMethods) if (binding.nameKey == nameKey) return binding.handle;
+		return nullptr;
+	}
+	mutable std::vector<MethodBinding>			cachedMethods;
+	mutable std::vector<StringName>				cachedMethodNames;
+	mutable std::vector<PropertyBinding>		cachedProperties;
+
+	// Checked on every script call, so the hit path is inline and the rebuild is not.
+	void EnsureCallCache() const
+	{
+		if (callCacheValid && callCacheGeneration == JenovaInterpreter::GetModuleGeneration()) return;
+		RebuildCallCache();
+	}
+	void RebuildCallCache() const;
+	void CallInternalMethod(const StringName& p_method, GDExtensionCallError& r_error, Variant& r_return);
+	void ReleaseCachedProperties() const;
+	void SyncPropertyMirror() const;
+
 public:
 	// Base Methods
 	bool set(const StringName& p_name, const Variant& p_value) override;
@@ -49,6 +109,7 @@ public:
 	bool has_method(const StringName& p_method) const override;
 	int get_method_argument_count(const StringName& p_method, bool* r_is_valid = nullptr) const override;
 	Variant callp(const StringName& p_method, const Variant** p_args, int p_argcount, GDExtensionCallError& r_error) override;
+	void callp_into(const StringName& p_method, const Variant** p_args, int p_argcount, GDExtensionCallError& r_error, Variant& r_return) override;
 	void notification(int p_notification, bool p_reversed) override;
 	String to_string(bool* r_valid) override;
 	void refcount_incremented() override;

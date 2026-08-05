@@ -30,6 +30,8 @@ public:
     static bool ReloadModule(const uint8_t* moduleDataPtr, size_t moduleSize, const jenova::SerializedData& metaData);
     static bool ReloadModule(const jenova::BuildResult& buildResult);
     static bool UnloadModule(const jenova::ModuleUnloadStage& unloadStage);
+    static uint64_t GetModuleGeneration();
+    static jenova::PropertySetMethod GetPropertySetMethod();
     static bool LoadDebugSymbol(const std::string symbolFilePath);
     static intptr_t GetModuleBaseAddress();
     static std::string GetScriptPath(const std::string& scriptUID);
@@ -44,9 +46,13 @@ public:
     static jenova::ScriptFunctionContainer GetFunctionContainer(const std::string& scriptUID);
     static jenova::ScriptPropertyContainer GetPropertyContainer(const std::string& scriptUID);
     static Variant CallFunction(const godot::Object* objectPtr, void* instance, const std::string& functionName, std::string& scriptUID, const Variant** functionParameters, const int functionParametersCount);
+    static void* ResolveFunctionHandle(const std::string& functionName, const std::string& scriptUID);
+    static Variant CallFunctionByHandle(void* functionHandle, const godot::Object* objectPtr, void* instance, const Variant** functionParameters, const int functionParametersCount);
+    static void CallFunctionByHandleInto(void* functionHandle, const godot::Object* objectPtr, void* instance, const Variant** functionParameters, const int functionParametersCount, Variant& r_return);
     static void SetExecutionPermission(bool executionState);
-    static void SetExecutionState(bool executionState);
-    static bool IsExecutingFunction();
+    // Inline: both are read or written twice per script call and were cross-unit calls.
+    static void SetExecutionState(bool executionState) { isExecuting = executionState; }
+    static bool IsExecutingFunction() { return isExecuting; }
     static void AbortExecution();
     static std::string GenerateFunctionUniqueID(const std::string& scriptPath, const std::string& functionName);
     static Variant GenerateFunctionCallError(const std::string& functionName, const String& errorReason);
@@ -94,4 +100,11 @@ private:
     static inline jenova::InterpreterBackend    interpreterBackend      = jenova::InterpreterBackend::TinyCC;
     static inline jenova::PointerStorage        propertyStorage         = jenova::PointerStorage();
     static inline jenova::PropertySetMethod     propertySetMethod       = jenova::PropertySetMethod::DirectAssign;
+
+    /*
+        Bumped on every module load/unload. Function addresses, the property storage
+        pointers and the module-relative property addresses all die with the module, so
+        anything caching them (script instances) compares this to know it must rebuild.
+    */
+    static inline uint64_t                      moduleGeneration        = 0;
 };

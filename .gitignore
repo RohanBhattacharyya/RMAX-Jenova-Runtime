@@ -370,3 +370,5 @@ FodyWeavers.xsd
 /Libs
 /Dependencies
 /Toolchain
+
+build_and_bench.sh

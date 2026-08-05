@@ -754,9 +754,19 @@ namespace jenova::sdk
 	{
 		return (T*)(caller->self);
 	}
-	template <typename T> T* GetSelf(godot::Variant self)
+	/*
+		Scripts call this at the top of every callback to reach their own node, so it is on
+		the hot path of every engine-to-C++ call.
+
+		Taking the Variant by value copied it. godot-cpp's Object::cast_to then built a
+		StringName from the class name, asked ClassDB for its tag and performed a checked
+		cast, which is three engine round trips to re-discover a type the script already
+		named. The owner never changes type, and the Caller* overload above has always been
+		an unchecked cast, so this one matches it.
+	*/
+	template <typename T> T* GetSelf(const godot::Variant& self)
 	{
-		return godot::Object::cast_to<T>(self);
+		return static_cast<T*>(static_cast<godot::Object*>(self));
 	}
 	template <typename T> T* GetNode(const godot::String& nodePath)
 	{ 

@@ -29,6 +29,26 @@ For more information and to view the full feature list, check out the details [h
 
 This repository contains the full source code of **Jenova Runtime**, a full-featured scripting backend with a wide range of capabilities including a Build System, Compiler Interface, Script Objects, Script Language, Script Instances, Script Interpreter and more.
 
+## Performance
+
+RMAX-Jenova C++ scripts are faster than GDScript everywhere, and are indistinguishable from a hand-written GDExtension once the call is inside your code.
+
+Measured on stock **Godot 4.7.1 Mono** (the Mono build is used so all four languages can be compared in the same binary), 600 physics ticks after a 120-tick warmup, engine run with `--headless --fixed-fps 60` so wall time per tick is CPU work rather than the real-time pacing floor, process pinned with `taskset`, median of 5 runs.
+
+| | **RMAX-Jenova C++** | GDExtension | GDScript | C# |
+|---|---|---|---|---|
+| Inbound call — engine invoking `_physics_process` | **0.077 µs** | 0.032 µs | 0.171 µs | 2.545 µs |
+| Outbound call — script invoking `get_child_count()` | **0.0071 µs** | 0.0074 µs | 0.0230 µs | 0.0293 µs |
+| Pure compute — one loop iteration, no engine call | **0.00079 µs** | 0.00071 µs | 0.0149 µs | 0.0038 µs |
+| Gameplay script — player movement, ~10 engine calls/tick | **0.405 µs** | 0.317 µs | 0.771 µs | 6.964 µs |
+
+Versus GDScript: **2.2x faster** to enter a script, **3.2x faster** to call back into the engine, **19x faster** at plain computation, **1.9x faster** on a realistic movement script. Versus C#: 33x, 4.1x, 4.8x and 17x respectively.
+
+Disclaimer:
+
+- **Entering** a script is still ~2.4x more expensive than a native GDExtension class. A GDExtension method is a plain virtual call, while a script method has to travel through Godot's `ScriptInstance` interface and back across the GDExtension boundary. Everything after that point is identical. Most people use GDScript or C# as scripts in their games: using C++ through RMAX-Jenova will be faster than that for all use cases, and is still comparable to native GDExtension nonetheless.
+- On a script whose cost is dominated by the engine, the language barely matters. 500 `CharacterBody3D` running full `move_and_slide()` cost 6.25 µs per body per tick in RMAX-Jenova C++ against 6.55 µs in GDScript, only 5% apart, because the physics solver is ~85% of the frame.
+
 ## Issue/Bug Reports and Questions
 - If you want to report an issue or bug create a new thread at [Issues](https://github.com/Jenova-Framework/Jenova-Runtime/issues).
 - If you have any questions you can create a new thread at [Discussions](https://github.com/Jenova-Framework/J.E.N.O.V.A/discussions).

@@ -112,7 +112,7 @@ namespace jenova
 #if defined(TARGET_PLATFORM_WINDOWS) && defined(_MSC_VER)
 
 	// Create Invoker
-		auto invoke_callp = [&]() { *ret = instance->callp(*method, args, p_argument_count, *r_error); };
+		auto invoke_callp = [&]() { instance->callp_into(*method, args, p_argument_count, *r_error, *ret); };
 
 		// Skip Managed Safe Execution If Disabled or Running in Debug Mode
 		if (!jenova::GlobalStorage::UseManagedSafeExecution || JenovaInterpreter::GetDebugModeExecutionState())
@@ -133,7 +133,7 @@ namespace jenova
 		}
 
 #else
-		*ret = instance->callp(*method, args, p_argument_count, *r_error);
+		instance->callp_into(*method, args, p_argument_count, *r_error, *ret);
 #endif
 	}
 	static void gdextension_script_instance_notification(GDExtensionScriptInstanceDataPtr p_instance, int32_t p_what, GDExtensionBool p_reversed)

@@ -105,14 +105,6 @@ static void FreePropertyList(const GDExtensionPropertyInfo& p_property)
 	memdelete((String*)p_property.hint_string);
 }
 
-// Internal Godot Functions
-static const jenova::FunctionList godot_functions =
-{
-	"_get_editor_name",
-	"_hide_script_from_inspector",
-	"_is_read_only",
-};
-
 // C++ Script Instance Implementation
 bool CPPScriptInstance::set(const StringName& p_name, const Variant& p_value)
 {
@@ -126,23 +118,15 @@ bool CPPScriptInstance::set(const StringName& p_name, const Variant& p_value)
 		return true;
 	}
 
-	// Set Interpreted Properties [Optimize This!]
-	if (instanceProperties.has(p_name))
+	// Set Interpreted Properties. Written straight into this instance's storage, which is
+	// what the script reads, and mirrored so serialization sees it too.
+	EnsureCallCache();
+	for (const PropertyBinding& binding : cachedProperties)
 	{
-		instanceProperties[p_name] = p_value;
+		if (binding.name != p_name) continue;
+		*binding.slot = p_value;
+		jenova::SetPropertyPointerValueFromVariant(binding.storage, p_value);
 		return true;
-	}
-	else
-	{
-		auto propContainer = JenovaInterpreter::GetPropertyContainer(AS_STD_STRING(GetIdentity()));
-		for (size_t i = 0; i < propContainer.scriptProperties.size(); i++)
-		{
-			if (p_name == propContainer.scriptProperties[i].propertyInfo.name)
-			{
-				instanceProperties[p_name] = p_value;
-				return true;
-			}
-		}
 	}
 
 	// Not Handled
@@ -167,23 +151,13 @@ bool CPPScriptInstance::get(const StringName& p_name, Variant& r_ret) const
 		return true;
 	}
 
-	// Get Interpreted Properties [Optimize This!]
+	// Get Interpreted Properties
+	EnsureCallCache();
+	SyncPropertyMirror();
 	if (instanceProperties.has(p_name))
 	{
 		r_ret = instanceProperties[p_name];
 		return true;
-	}
-	else
-	{
-		auto propContainer = JenovaInterpreter::GetPropertyContainer(AS_STD_STRING(GetIdentity()));
-		for (size_t i = 0; i < propContainer.scriptProperties.size(); i++)
-		{
-			if (p_name == propContainer.scriptProperties[i].propertyInfo.name)
-			{
-				r_ret = propContainer.scriptProperties[i].defaultValue;
-				return true;
-			}
-		}
 	}
 
 	// Not Handled
@@ -201,18 +175,24 @@ void CPPScriptInstance::notification(int p_notification, bool p_reversed)
 }
 Variant CPPScriptInstance::callp(const StringName& p_method, const Variant** p_args, const int p_argument_count, GDExtensionCallError& r_error)
 {
+	Variant callResult;
+	callp_into(p_method, p_args, p_argument_count, r_error, callResult);
+	return callResult;
+}
+void CPPScriptInstance::callp_into(const StringName& p_method, const Variant** p_args, const int p_argument_count, GDExtensionCallError& r_error, Variant& r_return)
+{
 	// Validate Scripting Backend
 	if (!jenova::GlobalSettings::ScriptingEnabled)
 	{
 		r_error.error = GDEXTENSION_CALL_ERROR_INSTANCE_IS_NULL;
-		return Variant();
+		return;
 	}
 
 	// Validate Instance & Script
 	if (isDeleting || !this->script.is_valid())
 	{
 		r_error.error = GDEXTENSION_CALL_ERROR_INVALID_METHOD;
-		return Variant();
+		return;
 	}
 
 	// Verbose Call
@@ -224,105 +204,75 @@ Variant CPPScriptInstance::callp(const StringName& p_method, const Variant** p_a
 			AS_C_STRING(script_name), AS_C_STRING(GetIdentity()), AS_C_STRING(p_method), p_argument_count, AS_C_STRING(owner_name), this->instance);
 	}
 
-	// Handle Internal Methods
-	if (p_method == StringName("_get_editor_name"))
-	{
-		r_error.error = GDEXTENSION_CALL_OK;
-		return Variant(String(jenova::Format("[ %s · Powered by Jenova ]", AS_C_STRING(godot::Object::cast_to<godot::Node>(this->owner)->get_name())).c_str()));
-	}
-	else if (p_method == StringName("_hide_script_from_inspector"))
-	{
-		r_error.error = GDEXTENSION_CALL_OK;
-		return false;
-	}
-	else if (p_method == StringName("_is_read_only"))
-	{
-		r_error.error = GDEXTENSION_CALL_OK;
-		return false;
-	}
+	// Resolve Everything That Is Fixed For The Lifetime Of The Loaded Module.
+	EnsureCallCache();
 
-	// Abort Call In Editor If Script is Not Tool
-	if (QUERY_ENGINE_MODE(Editor) && !script->is_tool())
-	{
-		r_error.error = GDEXTENSION_CALL_ERROR_INVALID_METHOD;
-		return Variant();
-	}
+	/*
+		Call to Interpreter.
 
-	// Initial Update for Properties
-	if (p_method == StringName("_enter_tree"))
+		Script methods are matched first. The internal method names below are never script
+		methods, and comparing them costs an engine round trip each in godot-cpp, so they
+		are only reached when the name is not the script's.
+	*/
+	void* jenovaMethod = FindMethodHandle(p_method);
+	if (jenovaMethod)
 	{
-		auto propContainer = JenovaInterpreter::GetPropertyContainer(AS_STD_STRING(GetIdentity()));
-		for (size_t i = 0; i < propContainer.scriptProperties.size(); i++)
+		// Abort Call In Editor If Script is Not Tool
+		if (QUERY_ENGINE_MODE(Editor) && !script->is_tool())
 		{
-			jenova::ScriptProperty scriptProperty = propContainer.scriptProperties[i];
-			if (!this->instanceProperties.has(scriptProperty.propertyInfo.name))
-			{
-				this->instanceProperties[scriptProperty.propertyInfo.name] = scriptProperty.defaultValue;
-			}
-			else
-			{
-				if (instanceProperties[scriptProperty.propertyInfo.name].get_type() == Variant::NIL)
-				{
-					this->instanceProperties[scriptProperty.propertyInfo.name] = scriptProperty.defaultValue;
-				}
-			}
-
-			// Set Initial Value of Property
-			Variant initialValue = this->instanceProperties[scriptProperty.propertyInfo.name];
-			JenovaInterpreter::SetPropertyValueFromVariant(scriptProperty.propertyInfo.name, initialValue, GetIdentity());
+			r_error.error = GDEXTENSION_CALL_ERROR_INVALID_METHOD;
+			return;
 		}
-	}
 
-	// Update Interpreter Properties
-	if (!this->instanceProperties.is_empty() && !JenovaInterpreter::IsExecutingFunction())
-	{
-		if (!ForcePushProperties())
-		{
-			jenova::Error("Jenova Interpreter", "Failed to Update Interpreter Property Storage Value!");
-			r_error.error = GDEXTENSION_CALL_ERROR_INVALID_ARGUMENT;
-			return Variant();
-		}
-	}
+		// Point The Module's Property Globals At This Instance
+		if (!cachedProperties.empty() && !JenovaInterpreter::IsExecutingFunction()) ForcePushProperties();
 
-	// Call to Interpreter
-	bool hasMethod = false;
-	jenova::FunctionList jenovaMethods = JenovaInterpreter::GetFunctionsList(AS_STD_STRING(GetIdentity()));
-	for (auto& function : jenovaMethods)
-	{
-		if (p_method == StringName(function.c_str()))
-		{
-			hasMethod = true;
-			break;
-		}
-	}
-	if (hasMethod)
-	{
-		// Invoke Function & Call
-		Variant callResult = JenovaInterpreter::CallFunction(this->owner, this, AS_STD_STRING(p_method), AS_STD_STRING(GetIdentity()), p_args, p_argument_count);
+		// Invoke Function & Call. The result goes straight into the Variant the engine
+		// supplied; a void script function leaves it untouched, which is the NIL the engine
+		// already put there.
+		JenovaInterpreter::CallFunctionByHandleInto(jenovaMethod, this->owner, this, p_args, p_argument_count, r_return);
 
-		// Update Properties
-		if (jenova::GlobalSettings::UpdatePropertiesAfterCall)
-		{
-			// Update Interpreter Properties
-			if (!this->instanceProperties.is_empty())
-			{
-				if (!ForcePullProperties())
-				{
-					jenova::Error("Jenova Interpreter", "Failed to Update Property Storage Value From Interpreter Property!");
-					r_error.error = GDEXTENSION_CALL_ERROR_INVALID_ARGUMENT;
-					return Variant();
-				}
-			}
-		}
+		// The script wrote into this instance's own storage, so the instanceProperties
+		// mirror is only marked stale here and refreshed when something reads it.
+		if (jenova::GlobalSettings::UpdatePropertiesAfterCall && !cachedProperties.empty()) propertyMirrorIsStale = true;
 
 		// Return Result
 		r_error.error = GDEXTENSION_CALL_OK;
-		return callResult;
+		return;
+	}
+
+	// Not a script method: the editor's internal ones, out of line so the hot call path
+	// above keeps a small frame.
+	CallInternalMethod(p_method, r_error, r_return);
+}
+void CPPScriptInstance::CallInternalMethod(const StringName& p_method, GDExtensionCallError& r_error, Variant& r_return)
+{
+	// Handle Internal Methods. Constructed once, since building a StringName hashes the
+	// text and takes the global name table lock.
+	static const StringName editorNameMethod("_get_editor_name");
+	static const StringName hideFromInspectorMethod("_hide_script_from_inspector");
+	static const StringName readOnlyMethod("_is_read_only");
+	if (p_method == editorNameMethod)
+	{
+		r_error.error = GDEXTENSION_CALL_OK;
+		r_return = Variant(String(jenova::Format("[ %s ï¿½ Powered by Jenova ]", AS_C_STRING(godot::Object::cast_to<godot::Node>(this->owner)->get_name())).c_str()));
+		return;
+	}
+	else if (p_method == hideFromInspectorMethod)
+	{
+		r_error.error = GDEXTENSION_CALL_OK;
+		r_return = false;
+		return;
+	}
+	else if (p_method == readOnlyMethod)
+	{
+		r_error.error = GDEXTENSION_CALL_OK;
+		r_return = false;
+		return;
 	}
 
 	// Default Result
 	r_error.error = GDEXTENSION_CALL_ERROR_INVALID_METHOD;
-	return Variant();
 }
 void CPPScriptInstance::update_methods() const
 {
@@ -495,8 +445,11 @@ bool CPPScriptInstance::validate_property(GDExtensionPropertyInfo& p_property) c
 }
 bool CPPScriptInstance::has_method(const StringName& p_name) const
 {
-	// Remove
-	jenova::VerboseByID(__LINE__, "CPPScriptInstance::has_method (%s) [%s]", AS_C_STRING(GetIdentity()), AS_C_STRING(p_name));
+	// Remove. Guarded, the arguments alone cost two heap allocations each.
+	if (jenova::GlobalStorage::DeveloperModeActivated)
+	{
+		jenova::VerboseByID(__LINE__, "CPPScriptInstance::has_method (%s) [%s]", AS_C_STRING(GetIdentity()), AS_C_STRING(p_name));
+	}
 
 	// Validate Script
 	if (!script.is_valid()) return false;
@@ -504,9 +457,15 @@ bool CPPScriptInstance::has_method(const StringName& p_name) const
 	bool result = false;
 
 	// Search Over Pre-Defined Functions [These will be not filtered by Tool Mode]
-	for (auto& function : godot_functions)
+	static const StringName godotFunctionNames[] =
 	{
-		if (p_name == StringName(function.c_str()))
+		StringName("_get_editor_name"),
+		StringName("_hide_script_from_inspector"),
+		StringName("_is_read_only"),
+	};
+	for (const StringName& function : godotFunctionNames)
+	{
+		if (p_name == function)
 		{
 			result = true;
 			break;
@@ -516,23 +475,19 @@ bool CPPScriptInstance::has_method(const StringName& p_name) const
 	// Jenova Module Functions Handling
 	if (!result)
 	{
-		// Get Jenova Function List And Search Over User Defined Functions
-		jenova::FunctionList jenovaMethods = JenovaInterpreter::GetFunctionsList(AS_STD_STRING(GetIdentity()));
-		for (auto& function : jenovaMethods)
-		{
-			if (p_name == StringName(function.c_str()))
-			{
-				result = true;
-				break;
-			}
-		}
+		// Search Over User Defined Functions
+		EnsureCallCache();
+		result = FindMethodHandle(p_name) != nullptr;
 
 		// In Editor and Tool Mode We Return All Functions As True
 		if (!result && QUERY_ENGINE_MODE(Editor) && script->is_tool()) result = true;
 	}
 
 	// Remove
-	jenova::VerboseByID(__LINE__, "CPPScriptInstance::has_method (%s) [%s] returned %s", AS_C_STRING(GetIdentity()), AS_C_STRING(p_name), result ? "TRUE" : "FALSE");
+	if (jenova::GlobalStorage::DeveloperModeActivated)
+	{
+		jenova::VerboseByID(__LINE__, "CPPScriptInstance::has_method (%s) [%s] returned %s", AS_C_STRING(GetIdentity()), AS_C_STRING(p_name), result ? "TRUE" : "FALSE");
+	}
 	return result;
 }
 int CPPScriptInstance::get_method_argument_count(const StringName& p_method, bool* r_is_valid) const
@@ -637,27 +592,124 @@ String CPPScriptInstance::GetIdentity() const
 {
 	return scriptInstanceIdentity;
 }
+void CPPScriptInstance::ReleaseCachedProperties() const
+{
+	// If the module is still loaded, aim its property globals back at the interpreter's
+	// own storage before this instance's storage goes away. A module shutdown event that
+	// touches a property after the last instance is gone would otherwise read freed memory.
+	const bool moduleStillLoaded = callCacheGeneration == JenovaInterpreter::GetModuleGeneration();
+	const String scriptIdentity = GetIdentity();
+	for (const PropertyBinding& binding : cachedProperties)
+	{
+		if (moduleStillLoaded && binding.address)
+		{
+			jenova::PropertyPointer sharedStorage = JenovaInterpreter::GetPropertyPointer(String(binding.name), scriptIdentity);
+			if (sharedStorage)
+			{
+				if (JenovaInterpreter::GetPropertySetMethod() == jenova::PropertySetMethod::MemoryCopy) memcpy((void*)binding.address, &sharedStorage, sizeof(sharedStorage));
+				else *(void**)binding.address = sharedStorage;
+			}
+		}
+		jenova::FreeVariantBasedProperty(binding.storage, binding.typeName);
+	}
+	cachedProperties.clear();
+}
+void CPPScriptInstance::SyncPropertyMirror() const
+{
+	// The script writes straight into this instance's storage, so instanceProperties is
+	// only brought up to date when something actually reads it.
+	if (!propertyMirrorIsStale) return;
+	propertyMirrorIsStale = false;
+	for (const PropertyBinding& binding : cachedProperties)
+	{
+		jenova::GetVariantFromPropertyPointer(binding.storage, *binding.slot, binding.slot->get_type());
+	}
+}
+void CPPScriptInstance::RebuildCallCache() const
+{
+	callCacheGeneration = JenovaInterpreter::GetModuleGeneration();
+	callCacheValid = true;
+	propertyMirrorIsStale = false;
+	cachedIdentity = AS_STD_STRING(GetIdentity());
+	cachedMethods.clear();
+	cachedMethodNames.clear();
+	ReleaseCachedProperties();
+
+	// Script Methods. Keyed by StringName so callp() is one hash lookup, and the value is
+	// the interpreter's resolved function handle, so the call skips the interpreter's own
+	// mutex and two string-keyed lookups as well.
+	for (const std::string& functionName : JenovaInterpreter::GetFunctionsList(cachedIdentity))
+	{
+		void* functionHandle = JenovaInterpreter::ResolveFunctionHandle(functionName, cachedIdentity);
+		if (!functionHandle) continue;
+
+		// The StringName is kept alive by cachedMethodNames so its interned pointer, which
+		// is what the key is, cannot be recycled while the binding is in use.
+		cachedMethodNames.push_back(StringName(functionName.c_str()));
+		cachedMethods.push_back({ MethodNameKey(cachedMethodNames.back()), functionHandle });
+	}
+
+	/*
+		Script Properties.
+
+		A script's properties are plain globals in the module, reached through a pointer
+		global that Jenova sets. That pointer used to be aimed at one storage slot shared by
+		every instance of the script, so entering a call meant copying this instance's values
+		into the shared slot and leaving it meant copying them back out. Two Variant
+		assignments per property per call, and it was the single most expensive thing about
+		calling into C++.
+
+		Every instance owns its storage now. Entering a call just aims the module's pointer
+		at this instance, which is one store, and the script then reads and writes the
+		instance's own memory, so there is nothing to copy back.
+	*/
+	const String scriptIdentity = GetIdentity();
+	jenova::ScriptPropertyContainer propertyContainer = JenovaInterpreter::GetPropertyContainer(cachedIdentity);
+	for (const jenova::ScriptProperty& scriptProperty : propertyContainer.scriptProperties)
+	{
+		PropertyBinding binding;
+		binding.name = scriptProperty.propertyInfo.name;
+
+		std::string shortName = AS_STD_STRING(String(binding.name).get_file());
+		binding.address = JenovaInterpreter::GetPropertyAddress(shortName, cachedIdentity);
+		if (!binding.address) continue;
+
+		binding.typeName = JenovaInterpreter::GetPropertyType(shortName, cachedIdentity);
+		binding.storage = jenova::AllocateVariantBasedProperty(binding.typeName);
+		if (!binding.storage) continue;
+
+		// Address of this instance's value inside instanceProperties. Indexing creates the
+		// entry if it is missing, so every script property has a slot from here on and no
+		// later insert can rehash the dictionary out from under these pointers.
+		// ponytail: assumes nothing erases keys from instanceProperties; nothing does.
+		binding.slot = &const_cast<Dictionary&>(instanceProperties)[binding.name];
+		if (binding.slot->get_type() == Variant::NIL) *binding.slot = scriptProperty.defaultValue;
+		jenova::SetPropertyPointerValueFromVariant(binding.storage, *binding.slot);
+
+		cachedProperties.push_back(binding);
+	}
+}
 bool CPPScriptInstance::ForcePushProperties()
 {
-	Array instancePropertiesKeys = instanceProperties.keys();
-	for (size_t i = 0; i < instancePropertiesKeys.size(); i++)
+	// Aim the module's property pointers at this instance's storage. One store each.
+	// callp() has already resolved the cache before reaching here.
+	const bool memoryCopy = JenovaInterpreter::GetPropertySetMethod() == jenova::PropertySetMethod::MemoryCopy;
+	for (const PropertyBinding& binding : cachedProperties)
 	{
-		if (!JenovaInterpreter::SetPropertyValueFromVariant(instancePropertiesKeys[i], instanceProperties[instancePropertiesKeys[i]], GetIdentity())) return false;
+		if (memoryCopy) memcpy((void*)binding.address, &binding.storage, sizeof(binding.storage));
+		else *(void**)binding.address = binding.storage;
 	}
+	propertyMirrorIsStale = true;
 
 	// All Good
 	return true;
 }
 bool CPPScriptInstance::ForcePullProperties()
 {
-	Array instancePropertiesKeys = instanceProperties.keys();
-	for (size_t i = 0; i < instancePropertiesKeys.size(); i++)
-	{
-		Variant variantValue = Variant::NIL;
-		jenova::PropertyPointer propertyPointer = JenovaInterpreter::GetPropertyPointer(instancePropertiesKeys[i], GetIdentity());
-		if (!jenova::GetVariantFromPropertyPointer(propertyPointer, variantValue, instanceProperties[instancePropertiesKeys[i]].get_type())) return false;
-		instanceProperties[instancePropertiesKeys[i]] = variantValue;
-	}
+	// Nothing to pull, the script wrote into this instance's own storage. The
+	// instanceProperties mirror is refreshed lazily, when something reads it.
+	EnsureCallCache();
+	propertyMirrorIsStale = !cachedProperties.empty();
 
 	// All Good
 	return true;
@@ -693,6 +745,9 @@ CPPScriptInstance::~CPPScriptInstance()
 
 	// Unregister Script Instance to Manager
 	JenovaScriptManager::get_singleton()->remove_script_instance(this);
+
+	// Release This Instance's Property Storage
+	ReleaseCachedProperties();
 
 	// Release Pointers
 	for (size_t i = 0; i < this->methodInfoPointers.size(); i++) delete this->methodInfoPointers[i];

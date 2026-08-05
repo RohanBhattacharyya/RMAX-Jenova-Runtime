@@ -1120,6 +1120,7 @@ namespace jenova
 	jenova::ScriptPropertyContainer CreatePropertyContainerFromMetadata(const jenova::SerializedData& propertyMetadata, const std::string& scriptUID);
 	void CleanVariantTypeName(std::string& typeName);
 	void* AllocateVariantBasedProperty(const std::string& typeName);
+	void FreeVariantBasedProperty(void* propertyPointer, const std::string& typeName);
 	bool SetPropertyPointerValueFromVariant(jenova::PropertyPointer propertyPointer, const Variant& variantValue);
 	bool GetVariantFromPropertyPointer(const jenova::PropertyPointer propertyPointer, godot::Variant& variantValue, const Variant::Type& variantType);
 	Variant CreateDefaultVariantFromType(Variant::Type variantType);
