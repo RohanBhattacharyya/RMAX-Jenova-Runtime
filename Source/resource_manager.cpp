@@ -92,7 +92,12 @@ bool JenovaResourceManager::CreateDatabaseFromArchive(const uint8_t* archivePtr,
 	a = archive_read_new();
 	archive_read_support_format_all(a);
 	archive_read_support_filter_all(a);
-	if ((r = archive_read_open_memory(a, archivePtr, archiveSize))) return false;
+	if ((r = archive_read_open_memory(a, archivePtr, archiveSize)))
+	{
+		jenova::Error("Jenova Resource Manager", "Failed to Open the %zu Byte Resource Archive, Reason [%d] : %s", archiveSize, r, archive_error_string(a));
+		archive_read_free(a);
+		return false;
+	}
 	for (;;)
 	{
 		// Read Next Header
@@ -161,21 +166,33 @@ bool JenovaResourceManager::ReleaseDatabase() const
 const jenova::MemoryBuffer& JenovaResourceManager::GetResourceRawBuffer(const String& dataID) const
 {
 	static const jenova::MemoryBuffer emptyBuffer;
-	if (!areResourcesLoaded) return emptyBuffer;
+	if (!areResourcesLoaded)
+	{
+		jenova::Warning("Jenova Resource Manager", "Resource '%s' Was Requested Before the Resource Database Was Loaded, Returning an Empty Buffer.", AS_C_STRING(dataID));
+		return emptyBuffer;
+	}
 	if (database.contains(dataID)) return database[dataID];
 	jenova::ErrorMessage("Jenova Resource Manager", "Invalid Resource '%s' Requested, Returning Empty Buffer.", AS_C_STRING(dataID));
 	return emptyBuffer;
 }
 const uint8_t* JenovaResourceManager::GetResourceRawFileData(const String& dataID) const
 {
-	if (!areResourcesLoaded) return nullptr;
+	if (!areResourcesLoaded)
+	{
+		jenova::Warning("Jenova Resource Manager", "Resource '%s' Was Requested Before the Resource Database Was Loaded, Returning Null.", AS_C_STRING(dataID));
+		return nullptr;
+	}
 	if (database.contains(dataID)) return database[dataID].data();
 	jenova::ErrorMessage("Jenova Resource Manager", "Invalid Resource '%s' Requested, Returning Null.", AS_C_STRING(dataID));
 	return nullptr;
 }
 size_t JenovaResourceManager::GetResourceRawFileSize(const String& dataID) const
 {
-	if (!areResourcesLoaded) return 0;
+	if (!areResourcesLoaded)
+	{
+		jenova::Warning("Jenova Resource Manager", "Resource '%s' Was Requested Before the Resource Database Was Loaded, Returning Zero.", AS_C_STRING(dataID));
+		return 0;
+	}
 	if (database.contains(dataID)) return database[dataID].size();
 	jenova::ErrorMessage("Jenova Resource Manager", "Invalid Resource '%s' Requested, Returning Zero.", AS_C_STRING(dataID));
 	return 0;

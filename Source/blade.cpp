@@ -200,6 +200,7 @@ static bool WriteStringToFile(const String& filePath, const String& str)
 	}
 	else
 	{
+		ErrorLog("Runtime", "Failed to Open [%s] for Writing, Godot Error Code : %d", GetStdStr(filePath).c_str(), int(FileAccess::get_open_error()));
 		return false;
 	}
 }
@@ -215,6 +216,7 @@ static String ReadStringFromFile(const String& filePath)
 	}
 	else
 	{
+		ErrorLog("Runtime", "Failed to Open [%s] for Reading, Godot Error Code : %d", GetStdStr(filePath).c_str(), int(FileAccess::get_open_error()));
 		return "";
 	}
 }
@@ -229,6 +231,7 @@ static bool WriteStdStringToFile(const std::string& filePath, const std::string&
 	}
 	else
 	{
+		ErrorLog("Runtime", "Failed to Open [%s] for Writing : %s", filePath.c_str(), strerror(errno));
 		return false;
 	}
 }
@@ -306,8 +309,12 @@ static String GetBladeCacheDirectory()
 			WriteStringToFile(bladeCacheDirectory + "/" + ".gdignore", "*");
 			WriteStringToFile(bladeCacheDirectory + "/" + ".gitignore", "*");
 		}
-		catch (const std::filesystem::filesystem_error& e)
+		catch (const std::filesystem::filesystem_error& cacheDirectoryError)
 		{
+			// Path is returned regardless, so every later write into it fails separately with
+			// no hint that the directory was never created.
+			ErrorLog("Runtime", "Failed to Create the Blade Cache Directory at [%s] (%s). Builds Will Fail Until This Path Is Writable.",
+				GetStdStr(bladeCacheDirectory).c_str(), cacheDirectoryError.what());
 		}
 	}
 
@@ -3178,8 +3185,9 @@ bool BladeLanguage::LoadBindingsDatabase()
 		bindingsDatabase = jenova::json_t::parse(GetStdStr(bindingsDatabaseContent));
 		return true;
 	}
-	catch (const std::exception&)
+	catch (const std::exception& bindingsError)
 	{
+		ErrorLog("Bindings Generator", "Failed to Parse the Bindings Database (%s). Blade Scripts Cannot Resolve Engine Types.", bindingsError.what());
 		return false;
 	}
 }

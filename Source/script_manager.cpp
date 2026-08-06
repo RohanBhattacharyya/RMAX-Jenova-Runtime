@@ -549,8 +549,9 @@ private:
 			// Load First Frame
 			return LoadProfilerFrame(0);
 		}
-		catch (const std::exception& error)
+		catch (const std::exception& profilerError)
 		{
+			jenova::Error("Jenova Profiler", "Failed to Load the Profiler Database [%s] (%s).", AS_C_STRING(databaseFile), profilerError.what());
 			return false;
 		}
 	}
@@ -638,8 +639,9 @@ private:
 			// All Good
 			return true;
 		}
-		catch (const std::exception&)
+		catch (const std::exception& profilerError)
 		{
+			jenova::Error("Jenova Profiler", "Failed to Load Profiler Frame %d of %d (%s).", frameNumber, totalLoadedFrames, profilerError.what());
 			return false;
 		}
 	}

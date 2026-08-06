@@ -733,14 +733,19 @@ def build_linux(compilerBinary, linkerBinary, buildMode, buildSystem):
     # Compile Source Code
     rgb_print("#367fff", "[ ^ ] Compiling Jenova Runtime Source Code...")
     with ThreadPoolExecutor(max_workers=len(sources)) as executor:
-        futures = []
+        futures = {}
         for source, command in compile_commands.items():
             if should_compile(source, cache):
-                futures.append(executor.submit(run_compile_command, command, source, compiler))
-                update_cache_entry(source, cache)
+                futures[executor.submit(run_compile_command, command, source, compiler)] = source
             else:
                 rgb_print("#f59b42", f"[ ! ] Skipping Compilation for {os.path.basename(source)}, No Changes Detected.")
-        for future in futures: future.result()
+
+        # Cache a source only once its compile has actually succeeded. Recording it at submit
+        # time meant a failed or interrupted build could leave the source marked as built, and
+        # the next build would skip it and link a stale object file.
+        for future, source in futures.items():
+            future.result()
+            update_cache_entry(source, cache)
 
     # Save Cache
     rgb_print("#367fff", "[ ^ ] Saving Cache...")
@@ -1361,19 +1366,24 @@ def build_windows(compilerBinary, linkerBinary, buildMode, buildSystem):
             rgb_print("#367fff", "[ ^ ] Compiling Jenova Runtime Source Code...")
             if buildMode == "win-msvc":
                 run_compile_command(compile_command, "MSVC Compilation", compiler)
+
+                # One batch command covers every source, so reaching here means all of them built.
+                for source in sources: update_cache_entry(source, cache)
             if buildMode == "win-clangcl":
                 with ThreadPoolExecutor(max_workers=len(sources)) as executor:
-                    futures = []
+                    futures = {}
                     for source, command in compile_commands.items():
                         if should_compile(source, cache):
-                            futures.append(executor.submit(run_compile_command, command, source, compiler))
-                            update_cache_entry(source, cache)
+                            futures[executor.submit(run_compile_command, command, source, compiler)] = source
                         else:
                             rgb_print("#f59b42", f"[ ! ] Skipping Compilation for {os.path.basename(source)}, No Changes Detected.")
-                    for future in futures: future.result()
 
-            # Update Cache
-            for source in sources: update_cache_entry(source, cache)
+                    # Cache a source only once its compile has actually succeeded. Recording it at submit
+                    # time meant a failed or interrupted build could leave the source marked as built, and
+                    # the next build would skip it and link a stale object file.
+                    for future, source in futures.items():
+                        future.result()
+                        update_cache_entry(source, cache)
 
             # Save Cache
             rgb_print("#367fff", "[ ^ ] Saving Cache...")
@@ -1489,14 +1499,19 @@ def build_windows(compilerBinary, linkerBinary, buildMode, buildSystem):
         # Compile Source Code
         rgb_print("#367fff", "[ ^ ] Compiling Jenova Runtime Source Code...")
         with ThreadPoolExecutor(max_workers=len(sources)) as executor:
-            futures = []
+            futures = {}
             for source, command in compile_commands.items():
                 if should_compile(source, cache):
-                    futures.append(executor.submit(run_compile_command, command, source, compiler))
-                    update_cache_entry(source, cache)
+                    futures[executor.submit(run_compile_command, command, source, compiler)] = source
                 else:
                     rgb_print("#f59b42", f"[ ! ] Skipping Compilation for {os.path.basename(source)}, No Changes Detected.")
-            for future in futures: future.result()
+
+            # Cache a source only once its compile has actually succeeded. Recording it at submit
+            # time meant a failed or interrupted build could leave the source marked as built, and
+            # the next build would skip it and link a stale object file.
+            for future, source in futures.items():
+                future.result()
+                update_cache_entry(source, cache)
 
         # Save Cache
         rgb_print("#367fff", "[ ^ ] Saving Cache...")

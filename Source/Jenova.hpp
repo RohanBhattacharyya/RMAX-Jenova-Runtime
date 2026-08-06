@@ -98,6 +98,9 @@
 #include <limits.h>
 #include <link.h>
 #include <cxxabi.h>
+#include <csignal>
+#include <csetjmp>
+#include <execinfo.h>
 #endif
 
 // Web SDK
@@ -121,6 +124,7 @@
 #include <regex>
 #include <string>
 #include <cstring>
+#include <cerrno>
 #include <vector>
 #include <random>
 #include <fstream>
@@ -827,6 +831,18 @@ namespace jenova
 		int							maxCalls = 1;
 	};
 
+	// Script Execution Identity
+	/*
+		Which script and which function, as plain C strings. Filled once per script function
+		when its interpreter metadata is resolved, so the per-call cost of knowing where the
+		engine is amounts to publishing one pointer.
+	*/
+	struct ScriptExecutionIdentity
+	{
+		const char* scriptPath		= nullptr;
+		const char* functionName	= nullptr;
+	};
+
 	// Global Settings
 	namespace GlobalSettings
 	{
@@ -849,6 +865,7 @@ namespace jenova
 		constexpr bool RespectSourceFilesEncoding				= true;
 		constexpr bool RegisterGlobalCrashHandler				= false;
 		constexpr bool CreateDumpOnExecutionCrash				= false;
+		constexpr bool RegisterFatalSignalHandler				= true;		// POSIX counterpart of the SEH handler Windows gets
 		constexpr bool LoadAndUnloadToolPackages				= true;
 		constexpr bool UpdatePropertiesAfterCall				= true;
 		constexpr bool DisableBuildAndRunWhileDebug				= true;
@@ -935,6 +952,24 @@ namespace jenova
 		extern bool												UseBuiltinSDK;
 		extern bool												RefreshSceneTreeAfterBuild;
 		extern int												TerminalDefaultFontSize;
+
+		/*
+			What The Interpreter Is Running Right Now.
+
+			A script that faults takes the whole process with it, and until something records
+			where the engine was, the report is an address in an anonymous mapping.
+
+			Both names are fixed for a given script function, so they are resolved once when its
+			metadata is built and only a pointer to the pair moves per call. That is one load
+			and two stores -- tracking the two strings separately cost three times as much and
+			measured about +0.8% on the inbound call path.
+
+			The pointed-to strings outlive every call into the module, so a fatal signal handler
+			reads them without touching the allocator. Deliberately a plain global rather than a
+			thread_local: a torn read across threads misnames a frame in a crash report, which
+			is a far smaller price than a TLS lookup on the hot call path.
+		*/
+		extern const jenova::ScriptExecutionIdentity*			ExecutingScript;
 	}
 
 	// Jenova Settings
@@ -1190,6 +1225,36 @@ namespace jenova
 	static LONG WINAPI JenovaGlobalCrashHandler(EXCEPTION_POINTERS* exceptionInfo);
 	LONG WINAPI JenovaExecutionCrashHandler(EXCEPTION_POINTERS* exceptionInfo);
 	#endif
+	#ifdef TARGET_PLATFORM_LINUX
+	bool InstallFatalSignalHandlers();
+	bool RemoveFatalSignalHandlers();
+
+	/*
+		Managed Safe Execution [POSIX]
+
+		Windows wraps every script call in __try/__except, reports the fault and lets the
+		process carry on. Linux had no counterpart, so a script that dereferenced null took the
+		whole process down -- and with it the error report, which the editor only ever sees
+		once the debugger queue is flushed on the next iteration of the main loop.
+
+		These give the fault somewhere to land. The caller installs a recovery point around the
+		script call with sigsetjmp; the signal handler returns control to it instead of letting
+		the process die, and the report is then made from ordinary code where calling into the
+		engine is safe and the message reaches the editor like any other error.
+
+		The jump abandons the faulting call's stack without running destructors, so whatever
+		that frame had allocated is leaked. That is the same trade the Windows path already
+		makes, and it buys a reported error instead of a silent exit.
+	*/
+	extern void* ScriptCallRecovery[5];
+	extern volatile sig_atomic_t ScriptCallRecoveryArmed;
+	extern volatile sig_atomic_t ScriptCallDepth;
+	extern volatile sig_atomic_t RecoveredSignalNumber;
+	void ReportRecoveredScriptCrash(int signalNumber);
+	#endif
+
+	// Script Diagnostics
+	std::string DescribeCurrentScriptExecution();
 
 	// SDK Management
 	JenovaSDKInterface CreateJenovaSDKInterface();

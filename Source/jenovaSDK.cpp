@@ -19,6 +19,7 @@
 
 // C++ SDK
 #include <stdarg.h>
+#include <cstdio>
 #include <iostream>
 #include <functional>
 

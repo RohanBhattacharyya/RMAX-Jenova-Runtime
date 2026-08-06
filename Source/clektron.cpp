@@ -237,6 +237,7 @@ extern "C" namespace ClektronSystem
         }
         else
         {
+            jenova::Error("Clektron", "Failed to Open [%s] for Writing : %s", filePath, strerror(errno));
             return false;
         }
     }
@@ -251,6 +252,7 @@ extern "C" namespace ClektronSystem
         }
         else
         {
+            jenova::Error("Clektron", "Failed to Open [%s] for Reading : %s", filePath, strerror(errno));
             return nullptr;
         }
     }
@@ -260,8 +262,11 @@ extern "C" namespace ClektronSystem
         {
             return std::filesystem::create_directories(directoryPath);
         }
-        catch (const std::exception&)
+        catch (const std::exception& fileSystemError)
         {
+            // Reported false and nothing else. A C script has no errno to inspect, so the
+            // reason the operation failed was simply unavailable to whoever called it.
+            jenova::Error("Clektron", "Failed to Create Directory [%s] : %s", directoryPath, fileSystemError.what());
             return false;
         }
     }
@@ -281,8 +286,11 @@ extern "C" namespace ClektronSystem
             std::filesystem::rename(oldPath, newPath);
             return true;
         }
-        catch (...)
+        catch (const std::exception& fileSystemError)
         {
+            // Reported false and nothing else. A C script has no errno to inspect, so the
+            // reason the operation failed was simply unavailable to whoever called it.
+            jenova::Error("Clektron", "Failed to Rename File [%s] to [%s] : %s", filePath, newName, fileSystemError.what());
             return false;
         }
     }
@@ -297,8 +305,11 @@ extern "C" namespace ClektronSystem
             }
             return false; // Not a directory
         }
-        catch (...)
+        catch (const std::exception& fileSystemError)
         {
+            // Reported false and nothing else. A C script has no errno to inspect, so the
+            // reason the operation failed was simply unavailable to whoever called it.
+            jenova::Error("Clektron", "Failed to Rename Directory [%s] to [%s] : %s", directoryPath, newName, fileSystemError.what());
             return false;
         }
     }
@@ -319,8 +330,11 @@ extern "C" namespace ClektronSystem
             std::filesystem::rename(source, destination);
             return true;
         }
-        catch (...)
+        catch (const std::exception& fileSystemError)
         {
+            // Reported false and nothing else. A C script has no errno to inspect, so the
+            // reason the operation failed was simply unavailable to whoever called it.
+            jenova::Error("Clektron", "Failed to Move File [%s] to [%s] : %s", srcPath, dstPath, fileSystemError.what());
             return false;
         }
     }
@@ -341,8 +355,11 @@ extern "C" namespace ClektronSystem
             std::filesystem::rename(source, destination);
             return true;
         }
-        catch (...)
+        catch (const std::exception& fileSystemError)
         {
+            // Reported false and nothing else. A C script has no errno to inspect, so the
+            // reason the operation failed was simply unavailable to whoever called it.
+            jenova::Error("Clektron", "Failed to Move Directory [%s] to [%s] : %s", srcPath, dstPath, fileSystemError.what());
             return false;
         }
     }
@@ -352,8 +369,11 @@ extern "C" namespace ClektronSystem
         {
             return std::filesystem::remove(filePath);
         }
-        catch (...)
+        catch (const std::exception& fileSystemError)
         {
+            // Reported false and nothing else. A C script has no errno to inspect, so the
+            // reason the operation failed was simply unavailable to whoever called it.
+            jenova::Error("Clektron", "Failed to Remove File [%s] : %s", filePath, fileSystemError.what());
             return false;
         }
     }
@@ -363,8 +383,11 @@ extern "C" namespace ClektronSystem
         {
             return std::filesystem::remove_all(directoryPath) > 0;
         }
-        catch (...)
+        catch (const std::exception& fileSystemError)
         {
+            // Reported false and nothing else. A C script has no errno to inspect, so the
+            // reason the operation failed was simply unavailable to whoever called it.
+            jenova::Error("Clektron", "Failed to Remove Directory [%s] : %s", directoryPath, fileSystemError.what());
             return false;
         }
     }
@@ -376,6 +399,7 @@ extern "C" namespace ClektronSystem
             fileInstances[filePath] = file;
             return static_cast<Instance>(file.get());
         }
+        jenova::Error("Clektron", "Failed to Create File [%s] : %s", filePath, strerror(errno));
         return nullptr;
     }
     Instance API_OpenFile(CString filePath)
@@ -386,6 +410,7 @@ extern "C" namespace ClektronSystem
             fileInstances[filePath] = file;
             return static_cast<Instance>(file.get());
         }
+        jenova::Error("Clektron", "Failed to Open File [%s] : %s", filePath, strerror(errno));
         return nullptr;
     }
     bool API_WriteFile(Instance fileInstance, Buffer bufferPtr, Size bufferSize)
@@ -394,8 +419,10 @@ extern "C" namespace ClektronSystem
         if (file && file->is_open())
         {
             file->write(static_cast<const char*>(bufferPtr), bufferSize);
+            if (!file->good()) jenova::Error("Clektron", "Failed to Write %zu Bytes to an Open File Handle : %s", size_t(bufferSize), strerror(errno));
             return file->good();
         }
+        jenova::Error("Clektron", "WriteFile Was Given a File Handle That Is Null or Not Open.");
         return false;
     }
     bool API_ReadFile(Instance fileInstance, Buffer bufferPtr, Size readPosition, Size readSize)
@@ -405,8 +432,10 @@ extern "C" namespace ClektronSystem
         {
             file->seekg(readPosition);
             file->read(static_cast<char*>(bufferPtr), readSize);
+            if (!file->good()) jenova::Error("Clektron", "Failed to Read %zu Bytes at Offset %zu, the File Is Shorter Than Requested.", size_t(readSize), size_t(readPosition));
             return file->good();
         }
+        jenova::Error("Clektron", "ReadFile Was Given a File Handle That Is Null or Not Open.");
         return false;
     }
     bool API_CloseFile(Instance fileInstance)
@@ -632,7 +661,11 @@ extern "C" namespace ClektronSystem
         ext = archive_write_disk_new();
         archive_write_disk_set_options(ext, flags);
         archive_write_disk_set_standard_lookup(ext);
-        if ((r = archive_read_open_filename(a, archivePath, 10240))) return false;
+        if ((r = archive_read_open_filename(a, archivePath, 10240)))
+        {
+            jenova::Error("Clektron Script System", InternalFormat("Failed to Open Archive [%s], Reason [%d] : %s", archivePath, r, archive_error_string(a)));
+            return false;
+        }
         for (;;)
         {
             // Read Next Header

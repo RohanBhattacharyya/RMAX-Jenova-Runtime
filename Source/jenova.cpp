@@ -185,6 +185,33 @@ namespace jenova
 				// Update Storage From Editor Settings
 				VALIDATE_FUNCTION(UpdateStorageConfigurations());
 
+				/*
+					Headless Build Request.
+
+					Building otherwise requires a human clicking the toolbar button: the editor
+					script that would call BuildProject is an EditorScript, and --script refuses
+					to load one. That left continuous integration, and anyone verifying a change
+					to the SDK header, with no way to rebuild a project at all.
+
+					Placed here rather than at the end of this function because the three calls
+					above are all BuildProject actually needs -- the plugin instance and the
+					compiler settings -- while everything below registers editor UI that a
+					headless run has no use for and that logs add_child failures of its own.
+					BuildProject's only use of the terminal panel is already behind a null check.
+
+					Note when testing this headlessly: jenova::Output is routed to the Jenova
+					terminal panel rather than stdout whenever that verbose mode is selected, so
+					neither this request nor the build's own progress appears in a captured log.
+					Check the build output timestamps instead.
+				*/
+				if (OS::get_singleton()->get_cmdline_args().has("--Build-Jenova-Project"))
+				{
+					jenova::Output("Headless Build Requested, Building Jenova Project...");
+					const bool buildSucceeded = BuildProject();
+					jenova::Output("Headless Build %s.", buildSucceeded ? "Succeeded" : "Failed");
+					jenova::ExitWithCode(buildSucceeded ? EXIT_SUCCESS : EXIT_FAILURE);
+				}
+
 				// Register Editor Terminal Panel
 				VALIDATE_FUNCTION(RegisterEditorTerminalPanel());
 
@@ -2022,8 +2049,10 @@ namespace jenova
 						{
 							if (std::filesystem::exists(binaryPath)) std::filesystem::remove(binaryPath);
 						}
-						catch (const std::exception&)
+						catch (const std::exception& cleanError)
 						{
+							jenova::Warning("Jenova Builder", "Failed to Remove Addon Binary [%s] While Cleaning (%s), It Was Left in Place.",
+								addonConfig.Binary.c_str(), cleanError.what());
 							continue;
 						}
 					}
@@ -2938,8 +2967,9 @@ namespace jenova
 					jenovaConfiguration["BuiltinPath"] = builtinPath;
 					jenovaConfigurationBase64 = jenova::CreateCompressedBase64FromStdString(jenovaConfiguration.dump(2));
 				}
-				catch (const std::exception&)
+				catch (const std::exception& configurationError)
 				{
+					jenova::Error("Jenova Exporter", "Failed to Build the Deployer Configuration (%s). The Export Cannot Continue.", configurationError.what());
 					return false;
 				}
 
@@ -5031,8 +5061,18 @@ namespace jenova
 				JenovaScriptManager::get_singleton()->register_script_runtime_start_event(&OnRuntimeStarted);
 
 				// Set the Custom Crash Handler
-				#ifdef TARGET_PLATFORM_WINDOWS 
+				#ifdef TARGET_PLATFORM_WINDOWS
 					if (jenova::GlobalSettings::RegisterGlobalCrashHandler) SetUnhandledExceptionFilter(jenova::JenovaGlobalCrashHandler);
+				#endif
+
+				// Report Fatal Faults Raised From Script Code. Windows gets this from the
+				// __try/__except around every call; on POSIX it takes a signal handler.
+				#ifdef TARGET_PLATFORM_LINUX
+					if (jenova::GlobalSettings::RegisterFatalSignalHandler)
+					{
+						if (jenova::InstallFatalSignalHandlers()) jenova::Verbose("Jenova Fatal Signal Handler Installed.");
+						else jenova::Warning("Jenova Core", "Failed to Install Fatal Signal Handler, Script Crashes Will Not Be Reported.");
+					}
 				#endif
 
 				// Initialize Runtime
@@ -5104,6 +5144,13 @@ namespace jenova
 
 				// Uninitialize Runtime
 				JenovaRuntime::deinit();
+
+				// Put the previous signal actions back before this library is unmapped, an
+				// installed handler pointing into unloaded code turns any later fault into a
+				// second, unreportable one.
+				#ifdef TARGET_PLATFORM_LINUX
+					jenova::RemoveFatalSignalHandlers();
+				#endif
 
 				// Release Extension
 				OnExtensionRelease();
@@ -5485,23 +5532,43 @@ namespace jenova
 
 		// Values
 		int TerminalDefaultFontSize										= 12;
+
+		// Script Execution Context
+		const jenova::ScriptExecutionIdentity* ExecutingScript			= nullptr;
 	}
 
 	// Operating System Abstraction Layer
 	#pragma region JenovaOS
 	jenova::ModuleHandle LoadModule(const char* libPath)
 	{
+		/*
+			A failed load is never expected and the reason is always available -- dlerror on
+			POSIX, GetLastError on Windows -- but it used to be dropped on the floor and the
+			caller got a bare null. A missing dependency and a wrong architecture then looked
+			identical, which is most of an afternoon.
+		*/
+
 		// Windows Implementation
 		#ifdef TARGET_PLATFORM_WINDOWS
-			return LoadLibraryA(libPath);
+			jenova::ModuleHandle windowsModule = LoadLibraryA(libPath);
+			if (!windowsModule) jenova::Error("Jenova Core", "Failed to Load Module [%s], Windows Error Code : %lu", libPath, GetLastError());
+			return windowsModule;
 		#endif
 
 		// Linux Implementation
 		#ifdef TARGET_PLATFORM_LINUX
-			return dlopen(libPath, RTLD_LAZY);
+			dlerror();
+			jenova::ModuleHandle linuxModule = dlopen(libPath, RTLD_LAZY);
+			if (!linuxModule)
+			{
+				const char* loaderError = dlerror();
+				jenova::Error("Jenova Core", "Failed to Load Module [%s] : %s", libPath, loaderError ? loaderError : "Unknown Loader Error");
+			}
+			return linuxModule;
 		#endif
 
 		// Not Implemented
+		jenova::Error("Jenova Core", "Module Loading Is Not Implemented on %s, Cannot Load [%s].", APP_ARCH, libPath);
 		return nullptr;
 	}
 	bool ReleaseModule(jenova::ModuleHandle moduleHandle)
@@ -5513,7 +5580,15 @@ namespace jenova
 
 		// Linux Implementation
 		#ifdef TARGET_PLATFORM_LINUX
-			 return (dlclose(moduleHandle) == 0);
+			 dlerror();
+			 if (dlclose(moduleHandle) != 0)
+			 {
+				 const char* loaderError = dlerror();
+				 jenova::Error("Jenova Core", "Failed to Unload Module [%p] : %s. It Stays Mapped for the Life of the Process.",
+					 moduleHandle, loaderError ? loaderError : "Unknown Loader Error");
+				 return false;
+			 }
+			 return true;
 		#endif
 
 		// Not Implemented
@@ -5521,14 +5596,29 @@ namespace jenova
 	}
 	void* GetModuleFunction(jenova::ModuleHandle moduleHandle, const char* functionName)
 	{
+		/*
+			Verbose, not Error. Callers probe for optional symbols here -- a module that has no
+			boot event is normal -- so a miss is only worth printing when someone is already
+			looking. The callers that cannot proceed without the symbol report it themselves.
+		*/
+
 		// Windows Implementation
 		#ifdef TARGET_PLATFORM_WINDOWS
-			return (void*)GetProcAddress(HMODULE(moduleHandle), functionName);
+			void* windowsSymbol = (void*)GetProcAddress(HMODULE(moduleHandle), functionName);
+			if (!windowsSymbol) jenova::Verbose("Symbol [%s] Not Found in Module [%p], Windows Error Code : %lu", functionName, moduleHandle, GetLastError());
+			return windowsSymbol;
 		#endif
 
 		// Linux Implementation
 		#ifdef TARGET_PLATFORM_LINUX
-			return dlsym(moduleHandle, functionName);
+			dlerror();
+			void* linuxSymbol = dlsym(moduleHandle, functionName);
+			if (!linuxSymbol)
+			{
+				const char* loaderError = dlerror();
+				jenova::Verbose("Symbol [%s] Not Found in Module [%p] : %s", functionName, moduleHandle, loaderError ? loaderError : "Not Present");
+			}
+			return linuxSymbol;
 		#endif
 
 		// Not Implemented
@@ -6765,7 +6855,14 @@ namespace jenova
 				jenova::WriteStringToFile(jenovaCacheDirectory + ".gdignore", "*");
 				jenova::WriteStringToFile(jenovaCacheDirectory + ".gitignore", "*");
 			}
-			catch (const std::filesystem::filesystem_error& e) { }
+			catch (const std::filesystem::filesystem_error& cacheDirectoryError)
+			{
+				// The path is handed back regardless, so every later write into it fails one
+				// at a time with no hint that the directory was never created.
+				jenova::Error("Jenova Core", "Failed to Create the Jenova Cache Directory at [%s] (%s). "
+					"Builds and Metadata Caching Will Fail Until This Path Is Writable.",
+					AS_C_STRING(jenovaCacheDirectory), cacheDirectoryError.what());
+			}
 		}
 
 		// Return Path
@@ -7034,7 +7131,12 @@ namespace jenova
 		}
 
 		// Validate Function
-		if (!InitializeModule) return false;
+		if (!InitializeModule)
+		{
+			jenova::Error("Jenova Core", "Module [%p] Exports No Initializer Named [%s]. It Was Not Built as a Jenova Module, or Was Built by a Different Runtime Version.",
+				moduleBase, initFuncName);
+			return false;
+		}
 
 		// Create A Clone from Initializer Data
 		ExtensionInitializerData extInitData = jenova::GlobalStorage::ExtensionInitData;
@@ -7042,7 +7144,12 @@ namespace jenova
 		extInitData.godotExtensionInitialization = &initData;
 
 		// Execute Initializer Function
-		if (!InitializeModule(&extInitData)) return false;
+		if (!InitializeModule(&extInitData))
+		{
+			jenova::Error("Jenova Core", "The Initializer [%s] of Module [%p] Reported Failure. The Module Is Loaded but Registered Nothing.",
+				initFuncName, moduleBase);
+			return false;
+		}
 
 		// All Good
 		return true;
@@ -7148,11 +7255,15 @@ namespace jenova
 			}
 			else
 			{
+				jenova::Error("Jenova Builder", "Failed to Open the Build Cache Database [%s] for Writing. "
+					"Every Later Build Will Recompile Everything.", cacheFile.c_str());
 				return false;
 			}
 		}
-		catch (const std::exception&)
+		catch (const std::exception& cacheError)
 		{
+			jenova::Error("Jenova Builder", "Failed to Write the Build Cache Database [%s] (%s). "
+				"Every Later Build Will Recompile Everything.", cacheFile.c_str(), cacheError.what());
 			return false;
 		}
 	}
@@ -7231,8 +7342,10 @@ namespace jenova
 
 			return buffer;
 		}
-		catch (const std::exception&)
+		catch (const std::exception& compressError)
 		{
+			// An empty buffer is indistinguishable from an empty input to every caller.
+			jenova::Error("Jenova Core", "Failed to Compress a %zu Byte Buffer (%s).", bufferSize, compressError.what());
 			return jenova::MemoryBuffer();
 		}
 	}
@@ -7283,8 +7396,10 @@ namespace jenova
 
 			return buffer;
 		}
-		catch (const std::exception&)
+		catch (const std::exception& decompressError)
 		{
+			jenova::Error("Jenova Core", "Failed to Decompress a %zu Byte Buffer (%s). The Data Is Corrupt or Was Not Produced by This Runtime.",
+				bufferSize, decompressError.what());
 			return jenova::MemoryBuffer();
 		}
 	}
@@ -7385,6 +7500,10 @@ namespace jenova
 		}
 		else
 		{
+			// Every caller of this used to propagate a bare false, so the one fact that
+			// mattered -- which file, and why -- died here rather than in any of them.
+			jenova::Error("Jenova Core", "Failed to Open [%s] for Writing, Godot Error Code : %d",
+				AS_C_STRING(filePath), int(FileAccess::get_open_error()));
 			return false;
 		}
 	}
@@ -7400,6 +7519,9 @@ namespace jenova
 		}
 		else
 		{
+			// An empty String is a legitimate file content, so a failed read was invisible.
+			jenova::Error("Jenova Core", "Failed to Open [%s] for Reading, Godot Error Code : %d",
+				AS_C_STRING(filePath), int(FileAccess::get_open_error()));
 			return "";
 		}
 	}
@@ -7414,6 +7536,7 @@ namespace jenova
 		}
 		else
 		{
+			jenova::Error("Jenova Core", "Failed to Open [%s] for Writing : %s", filePath.c_str(), strerror(errno));
 			return false;
 		}
 	}
@@ -7428,6 +7551,7 @@ namespace jenova
 		}
 		else
 		{
+			jenova::Error("Jenova Core", "Failed to Open [%s] for Reading : %s", filePath.c_str(), strerror(errno));
 			return "";
 		}
 	}
@@ -7449,6 +7573,7 @@ namespace jenova
 		}
 		else
 		{
+			jenova::Error("Jenova Core", "Failed to Open [%S] for Writing : %s", filePath.c_str(), strerror(errno));
 			return false;
 		}
 	}
@@ -7470,6 +7595,7 @@ namespace jenova
 		}
 		else
 		{
+			jenova::Error("Jenova Core", "Failed to Open [%S] for Reading : %s", filePath.c_str(), strerror(errno));
 			return L"";
 		}
 	}
@@ -7828,6 +7954,7 @@ namespace jenova
 		}
 		else
 		{
+			jenova::Error("Jenova Core", "Failed to Open [%s] for Writing %zu Bytes : %s", filePath.c_str(), memoryBuffer.size(), strerror(errno));
 			return false;
 		}
 	}
@@ -7842,6 +7969,7 @@ namespace jenova
 		}
 		else
 		{
+			jenova::Error("Jenova Core", "Failed to Open [%s] for Reading : %s", filePath.c_str(), strerror(errno));
 			return jenova::MemoryBuffer();
 		}
 	}
@@ -8109,8 +8237,10 @@ namespace jenova
 						// Add New Addon Config
 						addonList.push_back(addonConfig);
 					}
-					catch (const std::exception&)
+					catch (const std::exception& addonError)
 					{
+						jenova::Warning("Jenova Addon System", "Skipped Addon Package [%s], Its Configuration Could Not Be Read (%s).",
+							AS_C_STRING(addonPackage.pkgDestination), addonError.what());
 						continue;
 					}
 				}
@@ -8158,8 +8288,10 @@ namespace jenova
 						// Add New Tool Config
 						toolList.push_back(toolConfig);
 					}
-					catch (const std::exception&)
+					catch (const std::exception& toolError)
 					{
+						jenova::Warning("Jenova Tool System", "Skipped Tool Package [%s], Its Configuration Could Not Be Read (%s).",
+							AS_C_STRING(toolPackage.pkgDestination), toolError.what());
 						continue;
 					}
 				}
@@ -9175,8 +9307,12 @@ namespace jenova
 			// Return Container
 			return propertyContainer;
 		}
-		catch (const std::exception&)
+		catch (const std::exception& metadataError)
 		{
+			// Empty reads as "no exported properties", which the inspector renders without
+			// complaint, so a malformed property block used to look exactly like an empty one.
+			jenova::Error("Jenova Core", "Failed to Parse the Property Metadata of Script [%s] (%s). "
+				"Its Exported Properties Will Not Appear, Rebuild the Project.", scriptUID.c_str(), metadataError.what());
 			return jenova::ScriptPropertyContainer();
 		}
 	}
@@ -9861,8 +9997,9 @@ namespace jenova
 						}
 					}
 				}
-				catch (const std::exception&)
+				catch (const std::exception& addonError)
 				{
+					jenova::Warning("Addon Manager", "Failed to Install One of the Addon Modules (%s), It Was Skipped.", addonError.what());
 					continue;
 				}
 			}
@@ -9871,14 +10008,22 @@ namespace jenova
 	bool ExecutePackageScript(const std::string& packageScriptFile)
 	{
 		// Validate Script File
-		if (!std::filesystem::exists(packageScriptFile)) return false;
+		if (!std::filesystem::exists(packageScriptFile))
+		{
+			jenova::Error("Jenova Package Manager", "Package Script [%s] Does Not Exist, the Package Was Not Configured.", packageScriptFile.c_str());
+			return false;
+		}
 
 		// Windows Implementation
 		#ifdef TARGET_PLATFORM_WINDOWS
 			std::string command = "cmd /c \"" + packageScriptFile + "\"";
 			std::array<char, 128> buffer = {};
 			FILE* pipe = _popen(command.c_str(), "r");
-			if (!pipe) return false;
+			if (!pipe)
+			{
+				jenova::Error("Jenova Package Manager", "Failed to Run Package Script [%s] : %s", packageScriptFile.c_str(), strerror(errno));
+				return false;
+			}
 			while (fgets(buffer.data(), buffer.size(), pipe) != nullptr)
 			{
 				std::string line(buffer.data());
@@ -9895,7 +10040,11 @@ namespace jenova
 			std::string command = "/bin/bash \"" + packageScriptFile + "\"";
 			std::array<char, 128> buffer = {};
 			FILE* pipe = popen(command.c_str(), "r");
-			if (!pipe) return false;
+			if (!pipe)
+			{
+				jenova::Error("Jenova Package Manager", "Failed to Run Package Script [%s] : %s", packageScriptFile.c_str(), strerror(errno));
+				return false;
+			}
 			while (fgets(buffer.data(), buffer.size(), pipe) != nullptr)
 			{
 				std::string line(buffer.data());
@@ -9908,6 +10057,7 @@ namespace jenova
 		#endif
 
 		// Unsupported Platform
+		jenova::Error("Jenova Package Manager", "Running Package Scripts Is Not Supported on %s, [%s] Was Skipped.", APP_ARCH, packageScriptFile.c_str());
 		return false;
 	}
 	bool ProcessCommandLineArguments()
@@ -10067,8 +10217,12 @@ namespace jenova
 			return runtimeConfigurationSerializer.dump(2);
 
 		}
-		catch (const std::exception&)
+		catch (const std::exception& configurationError)
 		{
+			// "{}" parses cleanly everywhere downstream, so a failure here used to read as a
+			// project that simply has no settings.
+			jenova::Error("Jenova Core", "Failed to Generate the Runtime Module Configuration (%s). "
+				"The Runtime Will Start With Every Setting at Its Default.", configurationError.what());
 			return "{}";
 		}
 	}
@@ -10546,6 +10700,7 @@ namespace jenova
 		}
 		catch (const std::exception& error)
 		{
+			jenova::Warning("Jenova Core", "Failed to Download or Parse [%s%s] (%s).", hostName.c_str(), fileURL.c_str(), error.what());
 			return jenova::json_t{ {"Invalid", error.what()} };
 		}
 	}
@@ -10762,4 +10917,210 @@ namespace jenova
 		return EXCEPTION_EXECUTE_HANDLER;
 	}
 	#endif
+
+	/*
+		Fatal Signal Handler [POSIX]
+
+		Windows wraps every script call in __try/__except and gets a named exception, a symbol
+		and a source line out of it. Linux got nothing: a script that dereferences a null node
+		took the editor or the game down with an empty console, which is indistinguishable from
+		a clean exit and is the single worst thing about debugging a C++ script here.
+
+		Everything below runs after the process is already broken, so it is restricted to
+		async-signal-safe calls. No allocation, no godot::String, no printf: the allocator lock
+		may be held by the faulting thread, and taking it again inside the handler turns a
+		reported crash back into a silent hang.
+	*/
+	#ifdef TARGET_PLATFORM_LINUX
+	void* ScriptCallRecovery[5];
+	volatile sig_atomic_t ScriptCallRecoveryArmed = 0;
+	volatile sig_atomic_t ScriptCallDepth = 0;
+	volatile sig_atomic_t RecoveredSignalNumber = 0;
+
+	namespace
+	{
+		// The actions Godot (or anything else) had installed, so its own reporting still runs.
+		constexpr int FatalSignals[] = { SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT };
+		constexpr size_t FatalSignalCount = sizeof(FatalSignals) / sizeof(FatalSignals[0]);
+		struct sigaction PreviousSignalActions[FatalSignalCount];
+		bool FatalSignalHandlersInstalled = false;
+		// Fixed size on purpose: glibc 2.34 made SIGSTKSZ a sysconf() call, so it cannot size
+		// an array. 64 KiB is comfortably above MINSIGSTKSZ on every supported target.
+		char SignalHandlerStack[65536];
+
+		inline void SafeWrite(const char* text)
+		{
+			if (!text) text = "<null>";
+			size_t length = 0;
+			while (text[length] && length < 4096) length++;
+			ssize_t ignored = write(STDERR_FILENO, text, length);
+			(void)ignored;
+		}
+		inline void SafeWriteHex(unsigned long long value)
+		{
+			char digits[] = "0123456789abcdef";
+			char buffer[19] = { '0', 'x' };
+			for (int i = 0; i < 16; i++) buffer[2 + i] = digits[(value >> ((15 - i) * 4)) & 0xF];
+			buffer[18] = 0;
+			SafeWrite(buffer);
+		}
+		inline const char* DescribeSignal(int signalNumber)
+		{
+			switch (signalNumber)
+			{
+				case SIGSEGV:	return "SIGSEGV (Segmentation Fault : Invalid Memory Access)";
+				case SIGBUS:	return "SIGBUS (Bus Error : Misaligned or Unmapped Access)";
+				case SIGFPE:	return "SIGFPE (Arithmetic Error : Divide by Zero or Overflow)";
+				case SIGILL:	return "SIGILL (Illegal Instruction : Corrupt Code or Bad Function Pointer)";
+				case SIGABRT:	return "SIGABRT (Aborted : Unhandled C++ Exception or assert)";
+				default:		return "Unknown Fatal Signal";
+			}
+		}
+		void JenovaFatalSignalHandler(int signalNumber, siginfo_t* signalInfo, void* signalContext)
+		{
+			// A fault raised while reporting a fault must not loop back in here.
+			static volatile sig_atomic_t alreadyHandling = 0;
+			if (alreadyHandling) _exit(0x7F);
+			alreadyHandling = 1;
+
+			SafeWrite("\n================ Jenova Runtime :: Fatal Signal ================\n Signal            : ");
+			SafeWrite(DescribeSignal(signalNumber));
+			SafeWrite("\n Faulting Address  : ");
+			SafeWriteHex(signalInfo ? (unsigned long long)signalInfo->si_addr : 0ULL);
+
+			/*
+				The part no generic crash handler can give: which C++ script the engine was
+				inside. A null `self` reads as a fault at a small address, and the script and
+				function names below are what turn that into a one-line diagnosis.
+			*/
+			const jenova::ScriptExecutionIdentity* executingScript = jenova::GlobalStorage::ExecutingScript;
+			if (executingScript)
+			{
+				SafeWrite("\n C++ Script        : ");
+				SafeWrite(executingScript->scriptPath);
+				SafeWrite("\n Script Function   : ");
+				SafeWrite(executingScript->functionName);
+				if (signalNumber == SIGSEGV && signalInfo && (unsigned long long)signalInfo->si_addr < 0x10000ULL)
+				{
+					SafeWrite("\n Probable Cause    : Dereferenced a null pointer inside this script."
+							  "\n                     A `self` property that was never assigned reads as null here."
+							  "\n                     Assign it once from the Caller, e.g. in _enter_tree :"
+							  "\n                         self = GetSelf<YourNodeType>(instance);");
+				}
+			}
+			else
+			{
+				SafeWrite("\n C++ Script        : <none executing, fault is outside script code>");
+			}
+
+			// Native frames. backtrace_symbols_fd writes without allocating, unlike its
+			// backtrace_symbols sibling, which is why the raw fd variant is used here.
+			void* callStack[64];
+			int frameCount = backtrace(callStack, 64);
+			SafeWrite("\n---------------------------- Backtrace ----------------------------\n");
+			if (frameCount > 0) backtrace_symbols_fd(callStack, frameCount, STDERR_FILENO);
+			SafeWrite("===================================================================\n");
+
+			/*
+				If a script call installed a recovery point, go back to it. The process lives,
+				and the report is repeated from there through the engine's own error channel --
+				which is the only one the editor's Output dock actually shows, since a native
+				write to stderr goes to the terminal that launched the editor.
+			*/
+			if (ScriptCallRecoveryArmed)
+			{
+				alreadyHandling = 0;
+				ScriptCallRecoveryArmed = 0;
+				RecoveredSignalNumber = signalNumber;
+				__builtin_longjmp(ScriptCallRecovery, 1);
+			}
+
+			// Hand the signal back to whoever had it, so Godot's own crash reporting still
+			// runs and the process still dies with the right exit status.
+			for (size_t i = 0; i < FatalSignalCount; i++)
+			{
+				if (FatalSignals[i] != signalNumber) continue;
+				sigaction(signalNumber, &PreviousSignalActions[i], nullptr);
+				(void)signalContext;
+				raise(signalNumber);
+				return;
+			}
+			signal(signalNumber, SIG_DFL);
+			raise(signalNumber);
+		}
+	}
+	bool InstallFatalSignalHandlers()
+	{
+		if (FatalSignalHandlersInstalled) return true;
+
+		// Own stack, so a stack overflow inside a script is still reported instead of
+		// faulting again the moment the handler needs a frame.
+		stack_t handlerStack = {};
+		handlerStack.ss_sp = SignalHandlerStack;
+		handlerStack.ss_size = sizeof(SignalHandlerStack);
+		handlerStack.ss_flags = 0;
+		sigaltstack(&handlerStack, nullptr);
+
+		struct sigaction action = {};
+		action.sa_sigaction = &JenovaFatalSignalHandler;
+		action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
+		sigemptyset(&action.sa_mask);
+		for (size_t i = 0; i < FatalSignalCount; i++)
+		{
+			if (sigaction(FatalSignals[i], &action, &PreviousSignalActions[i]) != 0) return false;
+		}
+
+		FatalSignalHandlersInstalled = true;
+		return true;
+	}
+	bool RemoveFatalSignalHandlers()
+	{
+		if (!FatalSignalHandlersInstalled) return true;
+		for (size_t i = 0; i < FatalSignalCount; i++) sigaction(FatalSignals[i], &PreviousSignalActions[i], nullptr);
+		FatalSignalHandlersInstalled = false;
+		return true;
+	}
+	#endif
+
+	#ifdef TARGET_PLATFORM_LINUX
+	void ReportRecoveredScriptCrash(int signalNumber)
+	{
+		/*
+			Reached after the signal handler returned control here, so this is ordinary code
+			again and calling into the engine is safe. jenova::Error goes out through
+			push_error, which is what reaches the editor's Output dock -- the handler's own
+			stderr report never does, because the editor runs the game as a child process and
+			shows only what crosses the debugger connection.
+		*/
+		const jenova::ScriptExecutionIdentity* executingScript = jenova::GlobalStorage::ExecutingScript;
+		const std::string faultingScript = executingScript && executingScript->functionName
+			? jenova::Format("%s() in %s", executingScript->functionName,
+				executingScript->scriptPath ? executingScript->scriptPath : "<Unknown Script>")
+			: std::string("<Unknown Script Function>");
+		jenova::Error("C++ Script", "%s\n  In : %s\n  The call was abandoned and the engine kept running. "
+			"A `self` that was never assigned is the usual cause: set it from the Caller, e.g. "
+			"`self = GetSelf<YourNodeType>(instance);` in _enter_tree.",
+			DescribeSignal(signalNumber), faultingScript.c_str());
+
+		// Normally restored by the scope guard the jump skipped over.
+		jenova::GlobalStorage::ExecutingScript = nullptr;
+	}
+	#endif
+
+	/*
+		Script Diagnostics.
+
+		Errors raised from inside a running script are reported by the SDK header straight to
+		the engine, never through the bridge, so that a module built against a newer header
+		cannot call a vtable slot an older runtime does not have. What is left here is the
+		execution context the fatal signal handler reads.
+	*/
+	std::string DescribeCurrentScriptExecution()
+	{
+		const jenova::ScriptExecutionIdentity* executingScript = jenova::GlobalStorage::ExecutingScript;
+		if (!executingScript) return std::string("<No C++ Script Executing>");
+		return jenova::Format("%s() in %s",
+			executingScript->functionName ? executingScript->functionName : "<Unknown Function>",
+			executingScript->scriptPath ? executingScript->scriptPath : "<Unknown Script>");
+	}
 }

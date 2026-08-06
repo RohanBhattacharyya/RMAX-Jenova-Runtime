@@ -238,6 +238,8 @@ namespace jenova
     {
         std::string                     functionName;
         std::string                     scriptUID;
+        std::string                     scriptPath;               // res:// path, resolved once for the profiler and for crash reports
+        jenova::ScriptExecutionIdentity executionIdentity;        // c_str views of the two above, published per call for crash reports
         jenova::FunctionAddress         functionAddress   = 0;
         std::string                     returnType;
         std::string                     resolvedReturnType;       // C type name the backends rebuild the call with
@@ -355,7 +357,11 @@ bool JenovaInterpreter::InitializeInterpreter()
     if (isInitialized) return true;
     
     // Initialize Memory Module Loader
-    if (!JenovaLoader::Initialize()) return false;
+    if (!JenovaLoader::Initialize())
+    {
+        jenova::Error("Jenova Interpreter", "Failed to Initialize the In-Memory Module Loader. No C++ Script Can Be Loaded or Executed.");
+        return false;
+    }
 
     // All Good
     isInitialized = true;
@@ -371,10 +377,18 @@ bool JenovaInterpreter::ReleaseInterpreter()
     if (executeInDebugMode) return true;
 
     // It's Not Initialized
-    if (!isInitialized) return false;
+    if (!isInitialized)
+    {
+        jenova::Warning("Jenova Interpreter", "Interpreter Release Was Requested but It Was Never Initialized.");
+        return false;
+    }
 
     // Initialize Memory Module Loader
-    if (!JenovaLoader::Release()) return false;
+    if (!JenovaLoader::Release())
+    {
+        jenova::Error("Jenova Interpreter", "Failed to Release the In-Memory Module Loader. Module Memory Stays Mapped for the Life of the Process.");
+        return false;
+    }
 
     // All Good
     return true;
@@ -384,7 +398,11 @@ bool JenovaInterpreter::ReleaseInterpreter()
 bool JenovaInterpreter::LoadModule(const uint8_t* moduleDataPtr, size_t moduleSize, const jenova::SerializedData& metaData)
 {
     // Check If A Module Is Already Loaded
-    if (moduleBaseAddress) return false;
+    if (moduleBaseAddress)
+    {
+        jenova::Error("Jenova Interpreter", "A Module Is Already Loaded at 0x%llX, Load Request Rejected. Unload It First or Use ReloadModule.", (unsigned long long)moduleBaseAddress);
+        return false;
+    }
 
     // Update Metadata And Configuration
     if (!JenovaInterpreter::UpdateConfigurationsFromMetaData(metaData))
@@ -414,13 +432,25 @@ bool JenovaInterpreter::LoadModule(const uint8_t* moduleDataPtr, size_t moduleSi
         // Load Module As Regular
         moduleHandle = JenovaLoader::LoadModule((void*)moduleDataPtr, moduleSize, loaderFlags);
     }
-    if (!moduleHandle) return false;
+    if (!moduleHandle)
+    {
+        // Everything downstream of this -- every script method and property in the project --
+        // quietly does nothing when the module never mapped, so say it once here.
+        jenova::Error("Jenova Interpreter", "Failed to Map Jenova Module (%zu Bytes, Debug Information : %s) Into Memory. "
+            "The Build Output Is Corrupt or Was Produced for a Different Platform, Rebuild the Project.",
+            moduleSize, hasDebugInformation ? "Yes" : "No");
+        return false;
+    }
 
     // Get Module Base Address. A WebAssembly side module has none to report: its symbols
     // are resolved by name, so zero is the expected answer rather than a failure.
     moduleBaseAddress = JenovaLoader::GetModuleBaseAddress(moduleHandle);
     #ifndef TARGET_PLATFORM_WEB
-    if (!moduleBaseAddress) return false;
+    if (!moduleBaseAddress)
+    {
+        jenova::Error("Jenova Interpreter", "Jenova Module Mapped but Reports No Base Address, Scripts Cannot Be Executed.");
+        return false;
+    }
     #endif
 
     // Build Metadata Cache if Enabled
@@ -493,10 +523,18 @@ bool JenovaInterpreter::LoadModule(const jenova::BuildResult& buildResult)
 bool JenovaInterpreter::ReloadModule(const uint8_t* moduleDataPtr, size_t moduleSize, const jenova::SerializedData& metaData)
 {
     // Reload Not Supported In Debug Mode
-    if (executeInDebugMode) return false;
+    if (executeInDebugMode)
+    {
+        jenova::Error("Jenova Interpreter", "Module Reload Was Requested While Executing in Debug Mode, Which Cannot Reload. Detach the Debugger and Rebuild.");
+        return false;
+    }
 
     // Unload Module
-    if (!UnloadModule(jenova::ModuleUnloadStage::UnloadModuleToReload)) return false;
+    if (!UnloadModule(jenova::ModuleUnloadStage::UnloadModuleToReload))
+    {
+        jenova::Error("Jenova Interpreter", "Failed to Unload the Current Module, the New Build Was Not Applied and Scripts Are Still Running the Previous Code.");
+        return false;
+    }
 
     // Load Module
     return LoadModule(moduleDataPtr, moduleSize, metaData);
@@ -540,10 +578,23 @@ bool JenovaInterpreter::UnloadModule(const jenova::ModuleUnloadStage& unloadStag
     // If Debug Mode is Activated Unload Module Loaded From Disk
     if (executeInDebugMode) return jenova::ReleaseTemporaryModuleCache();
 
-    // Unload Module
-	if (!moduleHandle) return false;
-	if (!moduleBaseAddress) return false;
-    if (!JenovaLoader::ReleaseModule(moduleHandle)) return false;
+    // Unload Module. All three used to report a bare false, and the caller of an unload is
+    // usually a rebuild, which then reports only that the rebuild failed.
+	if (!moduleHandle)
+	{
+		jenova::Error("Jenova Interpreter", "Module Unload Was Requested but No Module Handle Is Held. The Runtime and the Editor Disagree About What Is Loaded.");
+		return false;
+	}
+	if (!moduleBaseAddress)
+	{
+		jenova::Error("Jenova Interpreter", "Module Unload Was Requested but the Loaded Module Has No Base Address. The Module State Is Inconsistent, Restart the Editor.");
+		return false;
+	}
+    if (!JenovaLoader::ReleaseModule(moduleHandle))
+    {
+        jenova::Error("Jenova Interpreter", "Failed to Release the Loaded Jenova Module. It Stays Mapped and the Next Build Will Not Take Effect, Restart the Editor.");
+        return false;
+    }
     moduleHandle = nullptr;
 	moduleBaseAddress = 0;
     moduleMetaData = "{}";
@@ -565,8 +616,12 @@ std::string JenovaInterpreter::GetScriptPath(const std::string& scriptUID)
     {
         return moduleMetaData["Scripts"][scriptUID]["path"].get<std::string>();
     }
-    catch (const std::exception&)
+    catch (const std::exception& metadataError)
     {
+        // Swallowed before. The path is what every later report about this script prints,
+        // so losing it silently makes every one of those reports say "Unknown" instead.
+        jenova::Warning("Jenova Interpreter", "Script UID [%s] Has No Path Recorded in the Module Metadata (%s). Rebuild the Project.",
+            scriptUID.c_str(), metadataError.what());
         return "Unknown";
     }
 }
@@ -594,9 +649,12 @@ jenova::FunctionList JenovaInterpreter::GetFunctionsList(const std::string& scri
             // Return List
             return functionNames;
         }
-        catch (const std::exception&)
+        catch (const std::exception& metadataError)
         {
-            // Error Happened
+            // An empty list here means the script exposes no methods at all, which the editor
+            // and the engine both accept without complaint. Say why it is empty.
+            jenova::Error("Jenova Interpreter", "Failed to Read the Method List of Script [%s] From Module Metadata (%s). "
+                "No Method of This Script Will Be Callable, Rebuild the Project.", GetScriptPath(scriptUID).c_str(), metadataError.what());
             return jenova::FunctionList();
         }
     }
@@ -634,9 +692,10 @@ jenova::FunctionAddress JenovaInterpreter::GetFunctionAddress(const std::string&
                 }
             }
         }
-        catch (const std::exception&)
+        catch (const std::exception& metadataError)
         {
-            // Error Happened
+            jenova::Error("Jenova Interpreter", "Failed to Read the Address of Function [%s] in Script [%s] From Module Metadata (%s). Rebuild the Project.",
+                functionName.c_str(), GetScriptPath(scriptUID).c_str(), metadataError.what());
             return 0;
         }
 
@@ -678,9 +737,10 @@ jenova::ParameterTypeList JenovaInterpreter::GetFunctionParameters(const std::st
                 }
             }
         }
-        catch (const std::exception&)
+        catch (const std::exception& metadataError)
         {
-            // Error Happened
+            jenova::Error("Jenova Interpreter", "Failed to Read the Parameter List of Function [%s] in Script [%s] From Module Metadata (%s). Rebuild the Project.",
+                functionName.c_str(), GetScriptPath(scriptUID).c_str(), metadataError.what());
             return jenova::ParameterTypeList();
         }
 
@@ -716,9 +776,10 @@ std::string JenovaInterpreter::GetFunctionReturn(const std::string& functionName
                 if (funcName.key() == functionName) return funcName.value()["ReturnType"].get<std::string>();
             }
         }
-        catch (const std::exception&)
+        catch (const std::exception& metadataError)
         {
-            // Error Happened
+            jenova::Error("Jenova Interpreter", "Failed to Read the Return Type of Function [%s] in Script [%s] From Module Metadata (%s). Rebuild the Project.",
+                functionName.c_str(), GetScriptPath(scriptUID).c_str(), metadataError.what());
             return "Unknown";
         }
 
@@ -811,8 +872,12 @@ jenova::ScriptPropertyContainer JenovaInterpreter::CreatePropertyContainer(const
         // Return List
         return propertyContainer;
     }
-    catch (const std::exception&)
+    catch (const std::exception& metadataError)
     {
+        // An empty container reads as "this script has no exported properties", so the
+        // inspector simply shows nothing and no one finds out the metadata was unreadable.
+        jenova::Error("Jenova Interpreter", "Failed to Build the Property Container for Script [%s] From Module Metadata (%s). "
+            "Its Exported Properties Will Not Appear or Bind, Rebuild the Project.", GetScriptPath(scriptUID).c_str(), metadataError.what());
         return jenova::ScriptPropertyContainer();
     }
 }
@@ -861,18 +926,45 @@ void* JenovaInterpreter::ResolveFunctionHandle(const std::string& functionName, 
 
     resolvedMetadata.functionName = functionName;
     resolvedMetadata.scriptUID = scriptUID;
+
+    // Resolved once and kept: the profiler wanted it per call, and a crash report has no
+    // way to build it at all once the process is faulting.
+    resolvedMetadata.scriptPath = JenovaInterpreter::GetScriptPath(scriptUID);
+    if (resolvedMetadata.scriptPath.empty() || resolvedMetadata.scriptPath == "Unknown") resolvedMetadata.scriptPath = "UID:" + scriptUID;
+
+    // Both strings are fixed for this function, so the pair a call publishes is built here,
+    // once, and the call itself only moves a pointer to it. Safe to point into these
+    // std::strings: the metadata entry is never moved or rewritten while the module lives.
+    resolvedMetadata.executionIdentity.scriptPath = resolvedMetadata.scriptPath.c_str();
+    resolvedMetadata.executionIdentity.functionName = resolvedMetadata.functionName.c_str();
+
     resolvedMetadata.functionAddress = JenovaInterpreter::GetFunctionAddress(functionName, scriptUID);
-    if (!resolvedMetadata.functionAddress) return abandon();
+    if (!resolvedMetadata.functionAddress)
+    {
+        jenova::Error("Jenova Interpreter", "Function [%s] of Script [%s] Has No Address in the Loaded Module. "
+            "The Module Is Out of Date or the Function Was Optimized Away, Rebuild the Project.", functionName.c_str(), resolvedMetadata.scriptPath.c_str());
+        return abandon();
+    }
 
     resolvedMetadata.returnType = JenovaInterpreter::GetFunctionReturn(functionName, scriptUID);
-    if (resolvedMetadata.returnType == "Unknown") return abandon();
+    if (resolvedMetadata.returnType == "Unknown")
+    {
+        jenova::Error("Jenova Interpreter", "Function [%s] of Script [%s] Has an Unknown Return Type and Cannot Be Called.",
+            functionName.c_str(), resolvedMetadata.scriptPath.c_str());
+        return abandon();
+    }
 
     // Resolved once. It is a pure function of the declared type, and working it out per
     // call meant string matching on every returning call into a script.
     resolvedMetadata.resolvedReturnType = jenova::ResolveReturnTypeForJIT(resolvedMetadata.returnType);
 
     resolvedMetadata.parameterTypes = JenovaInterpreter::GetFunctionParameters(functionName, scriptUID);
-    if (resolvedMetadata.parameterTypes.size() == 0) return abandon();
+    if (resolvedMetadata.parameterTypes.size() == 0)
+    {
+        jenova::Error("Jenova Interpreter", "Function [%s] of Script [%s] Has No Resolvable Parameter List. "
+            "Its Metadata Is Missing or Stale, Rebuild the Project.", functionName.c_str(), resolvedMetadata.scriptPath.c_str());
+        return abandon();
+    }
 
     resolvedMetadata.callMustReturn = JenovaInterpreter::IsFunctionReturnable(resolvedMetadata.returnType);
     resolvedMetadata.callHasParameters = !(resolvedMetadata.parameterTypes.size() == 1 && resolvedMetadata.parameterTypes[0] == "void");
@@ -927,11 +1019,33 @@ void JenovaInterpreter::CallFunctionByHandleInto(void* functionHandle, const god
     const bool needsPassingOwner = functionMetadata->needsPassingOwner;
     const int parameterOffset = functionMetadata->parameterOffset;
 
-    // Get Script Path. Only the profiler wants it, and building it unconditionally put a
-    // std::string on the stack of every script call.
-    std::string scriptPath;
+    // Get Script Path. Resolved with the rest of the function's metadata now, so the
+    // profiler no longer rebuilds a std::string on every script call.
+    const std::string& scriptPath = functionMetadata->scriptPath;
     const bool profilerEnabled = JenovaProfiler::IsEnabled();
-    if (profilerEnabled) scriptPath = GetScriptPath(scriptUID);
+
+    /*
+        Record What Is Executing.
+
+        One load and two stores. It buys the fatal signal handler, and any error a script
+        raises through the SDK, the name of the script and the function -- the difference
+        between a bare address and a line to open. Restoring rather than clearing keeps a
+        nested call from erasing the frame it was called from.
+
+        Publishing the two names separately was the obvious way to write this and cost three
+        times as much: nine memory operations per call instead of three, which measured
+        around +0.8% on the inbound path.
+    */
+    struct ExecutionContextScope
+    {
+        const jenova::ScriptExecutionIdentity* previous;
+        explicit ExecutionContextScope(const jenova::ScriptExecutionIdentity* identity)
+            : previous(jenova::GlobalStorage::ExecutingScript)
+        {
+            jenova::GlobalStorage::ExecutingScript = identity;
+        }
+        ~ExecutionContextScope() { jenova::GlobalStorage::ExecutingScript = previous; }
+    } executionContextScope(&functionMetadata->executionIdentity);
 
     // Pass Owner. Stack allocated. Same lifetime it had as a shared_ptr, and scripts only
     // read through it for the duration of the call.
@@ -1495,9 +1609,10 @@ jenova::PropertyList JenovaInterpreter::GetPropertiesList(std::string& scriptUID
             // Return List
             return propertyNames;
         }
-        catch (const std::exception&)
+        catch (const std::exception& metadataError)
         {
-            // Error Happened
+            jenova::Error("Jenova Interpreter", "Failed to Read the Property List of Script [%s] From Module Metadata (%s). "
+                "None of Its Exported Properties Will Bind, Rebuild the Project.", GetScriptPath(scriptUID).c_str(), metadataError.what());
             return jenova::PropertyList();
         }
     }
@@ -1530,9 +1645,10 @@ std::string JenovaInterpreter::GetPropertyType(const std::string& propertyName, 
                 if (prop.key() == propertyName) return prop.value()["Type"].get<std::string>();
             }
         }
-        catch (const std::exception&)
+        catch (const std::exception& metadataError)
         {
-            // Error Happened
+            jenova::Error("Jenova Interpreter", "Failed to Read the Type of Property [%s] in Script [%s] From Module Metadata (%s). Rebuild the Project.",
+                propertyName.c_str(), GetScriptPath(scriptUID).c_str(), metadataError.what());
             return std::string();
         }
 
@@ -1573,9 +1689,10 @@ jenova::PropertyAddress JenovaInterpreter::GetPropertyAddress(const std::string&
                 }
             }
         }
-        catch (const std::exception&)
+        catch (const std::exception& metadataError)
         {
-            // Error Happened
+            jenova::Error("Jenova Interpreter", "Failed to Read the Address of Property [%s] in Script [%s] From Module Metadata (%s). Rebuild the Project.",
+                propertyName.c_str(), GetScriptPath(scriptUID).c_str(), metadataError.what());
             return 0;
         }
 
@@ -1603,7 +1720,12 @@ bool JenovaInterpreter::SetPropertyValueFromVariant(const String& propertyName, 
     jenova::PropertyPointer propertyPtr = GetPropertyPointer(propertyName, scriptUID);
 
     // Validate Property Pointer
-    if (propertyPtr == nullptr) return false;
+    if (propertyPtr == nullptr)
+    {
+        jenova::Error("Jenova Interpreter", "Property [%s] of Script [%s] Has No Storage Registered, the Assigned Value Was Discarded.",
+            AS_C_STRING(propertyName), AS_C_STRING(scriptUID));
+        return false;
+    }
 
     // Set Property Value from Variant
     if (!jenova::SetPropertyPointerValueFromVariant(propertyPtr, propertyValue)) return false;
@@ -2678,7 +2800,12 @@ bool JenovaInterpreter::CreateModuleDatabase(const std::string& moduleDatabaseNa
 
     // Validate Inputs
     if (moduleDatabaseName.empty()) return false;
-    if (!moduleDataPtr || moduleSize == 0 || metaData.empty()) return false;
+    if (!moduleDataPtr || moduleSize == 0 || metaData.empty())
+    {
+        jenova::Error("Jenova Interpreter", "Refusing to Write Module Database [%s] From Incomplete Build Output (Module : %zu Bytes, Metadata : %zu Bytes).",
+            moduleDatabaseName.c_str(), moduleSize, metaData.size());
+        return false;
+    }
 
     // Create Header
     jenova::ModuleDatabaseHeader moduleDatabaseHeader;
@@ -2744,7 +2871,12 @@ bool JenovaInterpreter::DeployFromDatabase(const std::string& moduleDatabaseName
 
     // Open & Validate File
     Ref<FileAccess> moduleDatabaseReader = FileAccess::open(defaultModuleDatabasePath, FileAccess::READ);
-    if (!moduleDatabaseReader.is_valid()) return false;
+    if (!moduleDatabaseReader.is_valid())
+    {
+        jenova::Error("Jenova Interpreter", "Failed to Open the Module Database [%s]. It Was Not Built, Was Not Exported, or Is Not Readable. Rebuild the Project.",
+            AS_C_STRING(defaultModuleDatabasePath));
+        return false;
+    }
 
     // Read File
     PackedByteArray databaseFileBytes = moduleDatabaseReader->get_buffer(moduleDatabaseReader->get_length());
@@ -2753,7 +2885,12 @@ bool JenovaInterpreter::DeployFromDatabase(const std::string& moduleDatabaseName
     moduleDatabaseReader->close();
 
     // Validate Buffer
-    if (databaseRawData.size() == 0) return false;
+    if (databaseRawData.size() == 0)
+    {
+        jenova::Error("Jenova Interpreter", "The Module Database [%s] Is Empty. The Last Build Did Not Finish Writing It, Rebuild the Project.",
+            AS_C_STRING(defaultModuleDatabasePath));
+        return false;
+    }
 
     // Parse And Get Header
     jenova::ModuleDatabaseHeader* databaseHeader = (jenova::ModuleDatabaseHeader*)&databaseRawData[0];
@@ -2793,7 +2930,12 @@ bool JenovaInterpreter::DeployFromDatabase(const std::string& moduleDatabaseName
     jenova::MemoryBuffer encodedRawBuffer;
     encodedRawBuffer.insert(encodedRawBuffer.end(), databaseEncodedDataPtr, databaseEncodedDataPtr + databaseHeader->encodedDataSize);
     jenova::MemoryBuffer decompressedData = jenova::DecompressBuffer(encodedRawBuffer.data(), encodedRawBuffer.size());
-    if (decompressedData.size() == 0) return false;
+    if (decompressedData.size() == 0)
+    {
+        jenova::Error("Jenova Interpreter", "Failed to Decompress the Module Database [%s] (%zu Encoded Bytes). The File Is Truncated or Corrupt, Rebuild the Project.",
+            AS_C_STRING(defaultModuleDatabasePath), encodedRawBuffer.size());
+        return false;
+    }
 
     // Get Data Pointers
     const uint8_t* moduleDataPtr = decompressedData.data();

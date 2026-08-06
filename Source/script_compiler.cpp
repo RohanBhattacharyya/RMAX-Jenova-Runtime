@@ -2569,7 +2569,10 @@ namespace jenova
             return new MicrosoftCompiler(false);
         #endif
 
-        // Not Supported
+        // Not Supported. Returned null and left the caller to fail later with no idea that
+        // the requested compiler simply does not exist on this platform.
+        jenova::Error("Jenova Builder", "The %s Compiler Is Not Supported on %s. "
+            "Pick a Different Compiler in Project Settings > Jenova > Compiler Model.", "Microsoft Visual C++", APP_ARCH);
         return nullptr;
     }
     IJenovaCompiler* CreateClangCompiler()
@@ -2585,7 +2588,10 @@ namespace jenova
         #endif
 
 
-        // Not Supported
+        // Not Supported. Returned null and left the caller to fail later with no idea that
+        // the requested compiler simply does not exist on this platform.
+        jenova::Error("Jenova Builder", "The %s Compiler Is Not Supported on %s. "
+            "Pick a Different Compiler in Project Settings > Jenova > Compiler Model.", "Clang", APP_ARCH);
         return nullptr;
     }
     IJenovaCompiler* CreateMinGWCompiler(bool useLLVM)
@@ -2595,7 +2601,10 @@ namespace jenova
             return new MinGWCompiler(useLLVM);
         #endif
 
-        // Not Supported
+        // Not Supported. Returned null and left the caller to fail later with no idea that
+        // the requested compiler simply does not exist on this platform.
+        jenova::Error("Jenova Builder", "The %s Compiler Is Not Supported on %s. "
+            "Pick a Different Compiler in Project Settings > Jenova > Compiler Model.", "MinGW", APP_ARCH);
         return nullptr;
     }
     IJenovaCompiler* CreateGNUCompiler()
@@ -2605,7 +2614,10 @@ namespace jenova
             return new GNUCompiler();
         #endif
 
-        // Not Supported
+        // Not Supported. Returned null and left the caller to fail later with no idea that
+        // the requested compiler simply does not exist on this platform.
+        jenova::Error("Jenova Builder", "The %s Compiler Is Not Supported on %s. "
+            "Pick a Different Compiler in Project Settings > Jenova > Compiler Model.", "GNU GCC", APP_ARCH);
         return nullptr;
     }
 }

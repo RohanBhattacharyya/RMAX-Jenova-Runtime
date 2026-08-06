@@ -57,6 +57,37 @@
 #define JNVAPI_WRAPPER				static inline
 #define JNVAPI_INTERNAL(fn)			virtual fn
 
+/*
+	Diagnostics that must stay off the hot path.
+
+	Every guard the SDK adds sits in front of a call scripts make thousands of times a
+	frame, so the reporting half is pushed out of line and marked cold. What is left at the
+	call site is a load, a compare and a branch the predictor gets right every time.
+*/
+#if defined(_MSC_VER)
+	#define JNVAPI_COLD				static __declspec(noinline)
+	#define JENOVA_UNLIKELY(cond)	(cond)
+#else
+	#define JNVAPI_COLD				static inline __attribute__((noinline, cold))
+	#define JENOVA_UNLIKELY(cond)	(__builtin_expect(!!(cond), 0))
+#endif
+
+/*
+	Where the script called from.
+
+	Jenova preprocesses a script into its cache but emits a #line pointing back at the real
+	file, so __FILE__ and __LINE__ inside a script resolve to the path and line the author
+	actually wrote. As default arguments these are folded at each call site, which is the only
+	way a header-only helper can name its caller.
+*/
+#if defined(_MSC_VER) && _MSC_VER < 1926
+	#define JENOVA_CALLER_FILE		"<unknown file>"
+	#define JENOVA_CALLER_LINE		0
+#else
+	#define JENOVA_CALLER_FILE		__builtin_FILE()
+	#define JENOVA_CALLER_LINE		__builtin_LINE()
+#endif
+
 // Jenova Configuration Macros
 #define JENOVA_TOOL_SCRIPT
 
@@ -102,6 +133,7 @@
 // C++ Runtime Imports
 #ifndef JENOVA_SDK_BUILD
 	#include <cstdarg>
+	#include <cstdio>
 	#include <string>
 	#include <thread>
 	#include <functional>
@@ -115,6 +147,7 @@
 	#include <Godot/variant/variant.hpp>
 	#include <Godot/variant/string.hpp>
 	#include <Godot/variant/string_name.hpp>
+	#include <Godot/variant/utility_functions.hpp>
 	#include <Godot/classes/global_constants.hpp>
 	#include <Godot/classes/font.hpp>
 	#include <Godot/classes/texture2d.hpp>
@@ -758,9 +791,82 @@ namespace jenova::sdk
 		}
 	}
 
-	// Template Helpers
-	template <typename T> T* GetSelf(Caller* caller)
+	/*
+		Diagnostics :: Wrappers
+
+		Reported straight through the engine rather than through the SDK bridge, deliberately.
+		Routing this to the runtime would mean adding a method to the JenovaSDK interface, and
+		a module built against a header with that method but loaded by an older runtime would
+		call one vtable slot past the end of the real vtable -- an undefined jump, which is a
+		worse failure than the silence this whole effort exists to remove. Nothing here depends
+		on the runtime's version.
+
+		push_error is also what reaches the editor's Output dock: the running game is a child
+		process, and only what crosses the debugger connection is shown there. A plain write to
+		stderr lands in the terminal that launched the editor, where nobody is looking.
+	*/
+	JNVAPI_WRAPPER void ReportScriptError(StringPtr scope, StringPtr message, StringPtr file, int line)
 	{
+		godot::UtilityFunctions::push_error(godot::String("[Jenova C++ Script] [") + godot::String(scope ? scope : "Unknown") + "] "
+			+ godot::String(message ? message : "Unspecified Error.")
+			+ "\n  At : " + godot::String(file ? file : "<unknown file>") + ":" + godot::String::num_int64(line));
+	}
+
+	/*
+		Reached only when a script is one instruction away from dereferencing null.
+
+		This is the single most common way a C++ script kills the process: a `self` property
+		declared but never assigned, usually because the _enter_tree that assigns it was
+		commented out or renamed. The engine calls _ready, GetSelf hands back null, the very
+		next get_node() faults, and on POSIX that used to be the end of it -- no message, no
+		stack, just a window that closes. Naming the mistake here costs the caller a
+		not-taken branch.
+	*/
+	JNVAPI_COLD godot::Object* ReportInvalidSelfVariant(const godot::Variant& badSelf, StringPtr file, int line)
+	{
+		const godot::CharString actualType = godot::Variant::get_type_name(badSelf.get_type()).utf8();
+		char message[768];
+		snprintf(message, sizeof(message),
+			"The script's `self` holds %s and does not resolve to a live Object, so GetSelf<T>() returned null and the next member access will crash.\n"
+			"  `self` is only valid once it has been assigned from the Caller the engine passes in. Assign it before any other callback runs:\n"
+			"      void _enter_tree(Caller* instance) { self = GetSelf<YourNodeType>(instance); }\n"
+			"  A `self` left at its JENOVA_PROPERTY default reports as Int or Nil here. A `self` that reports as Object instead points at a node that has already been freed.",
+			actualType.get_data());
+		ReportScriptError("GetSelf", message, file, line);
+		return nullptr;
+	}
+	JNVAPI_COLD godot::Node* ReportMissingNode(StringPtr scope, const godot::String& nodeQuery, StringPtr file, int line)
+	{
+		const godot::CharString query = nodeQuery.utf8();
+		char message[768];
+		snprintf(message, sizeof(message),
+			"No node matched \"%s\", so a null was returned and the next member access will crash.\n"
+			"  The node was renamed or moved, the path is relative to the wrong parent, or the lookup ran before the node entered the tree.",
+			query.get_data());
+		ReportScriptError(scope, message, file, line);
+		return nullptr;
+	}
+	JNVAPI_COLD void ReportMissingGlobal(StringPtr scope, MemoryID id, StringPtr file, int line)
+	{
+		char message[512];
+		snprintf(message, sizeof(message),
+			"No global memory is registered under the id \"%s\". Allocate it with AllocateGlobalMemory or SetGlobalPointer before reading it.",
+			id ? id : "<null>");
+		ReportScriptError(scope, message, file, line);
+	}
+	JNVAPI_COLD godot::Object* ReportInvalidSelfCaller(Caller* badCaller, StringPtr file, int line)
+	{
+		ReportScriptError("GetSelf", badCaller
+			? "The Caller the engine passed in carries a null owner, so GetSelf<T>() returned null and the next member access will crash. The node this script is attached to is being destroyed, or the call arrived before the script was bound to it."
+			: "GetSelf<T>() was given a null Caller, so it returned null and the next member access will crash. Only the pointer a script callback receives as its first parameter is a valid Caller.",
+			file, line);
+		return nullptr;
+	}
+
+	// Template Helpers
+	template <typename T> T* GetSelf(Caller* caller, StringPtr _file = JENOVA_CALLER_FILE, int _line = JENOVA_CALLER_LINE)
+	{
+		if (JENOVA_UNLIKELY(!caller || !caller->self)) return static_cast<T*>(ReportInvalidSelfCaller(caller, _file, _line));
 		return (T*)(caller->self);
 	}
 	/*
@@ -772,26 +878,44 @@ namespace jenova::sdk
 		cast, which is three engine round trips to re-discover a type the script already
 		named. The owner never changes type, and the Caller* overload above has always been
 		an unchecked cast, so this one matches it.
+
+		The guard below deliberately tests the result of that same cast rather than asking
+		the Variant for its type first: get_type() is another call through the extension
+		interface, and the conversion already yields null for anything that is not a live
+		object. What is added at the call site is a test and a branch on a register that is
+		already loaded. Naming the type costs a round trip, so it happens in the cold path,
+		once, on the way to an error message.
 	*/
-	template <typename T> T* GetSelf(const godot::Variant& self)
+	template <typename T> T* GetSelf(const godot::Variant& self, StringPtr _file = JENOVA_CALLER_FILE, int _line = JENOVA_CALLER_LINE)
 	{
-		return static_cast<T*>(static_cast<godot::Object*>(self));
+		godot::Object* selfObject = static_cast<godot::Object*>(self);
+		if (JENOVA_UNLIKELY(selfObject == nullptr)) return static_cast<T*>(ReportInvalidSelfVariant(self, _file, _line));
+		return static_cast<T*>(selfObject);
 	}
-	template <typename T> T* GetNode(const godot::String& nodePath)
-	{ 
-		return static_cast<T*>(GetNodeByPath(nodePath));
-	}
-	template <typename T> T* FindNode(godot::Node* parent, const godot::String& nodeName)
+	template <typename T> T* GetNode(const godot::String& nodePath, StringPtr _file = JENOVA_CALLER_FILE, int _line = JENOVA_CALLER_LINE)
 	{
-		return static_cast<T*>(FindNodeByName(parent, nodeName));
+		godot::Node* node = GetNodeByPath(nodePath);
+		if (JENOVA_UNLIKELY(node == nullptr)) return static_cast<T*>(ReportMissingNode("GetNode", nodePath, _file, _line));
+		return static_cast<T*>(node);
+	}
+	template <typename T> T* FindNode(godot::Node* parent, const godot::String& nodeName, StringPtr _file = JENOVA_CALLER_FILE, int _line = JENOVA_CALLER_LINE)
+	{
+		godot::Node* node = FindNodeByName(parent, nodeName);
+		if (JENOVA_UNLIKELY(node == nullptr)) return static_cast<T*>(ReportMissingNode("FindNode", nodeName, _file, _line));
+		return static_cast<T*>(node);
 	}
 	template <typename T> T* GlobalPointer(MemoryID id)
-	{ 
+	{
 		return static_cast<T*>(GetGlobalPointer(id));
 	}
 	template <typename T> T GlobalGet(MemoryID id)
 	{
-		return *(static_cast<T*>(GetGlobalPointer(id)));
+		// An id that was never allocated faults on the dereference below. The fault is left
+		// exactly where it was -- inventing a default T here would hide a real bug behind a
+		// plausible zero -- but it no longer happens without a word about which id it was.
+		void* globalPointer = GetGlobalPointer(id);
+		if (JENOVA_UNLIKELY(globalPointer == nullptr)) ReportMissingGlobal("GlobalGet", id, JENOVA_CALLER_FILE, JENOVA_CALLER_LINE);
+		return *(static_cast<T*>(globalPointer));
 	}
 	template <typename T> void GlobalSet(MemoryID id, const T& newValue)
 	{

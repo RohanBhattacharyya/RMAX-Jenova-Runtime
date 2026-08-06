@@ -846,9 +846,9 @@ bool JenovaPackageManager::ObtainInstalledPackages()
 		// All Good
 		return true;
 	}
-	catch (const std::exception&)
+	catch (const std::exception& packageError)
 	{
-		// Failed
+		jenova::Error("Jenova Package Manager", "Failed to Read the Installed Packages Database (%s). Installed Packages Will Not Be Listed.", packageError.what());
 		return false;
 	}
 
@@ -897,9 +897,9 @@ bool JenovaPackageManager::CacheInstalledPackages()
 		// All Good
 		return true;
 	}
-	catch (const std::exception&)
+	catch (const std::exception& packageError)
 	{
-		// Failed
+		jenova::Error("Jenova Package Manager", "Failed to Write the Installed Packages Database (%s). The Package List Will Be Stale on the Next Start.", packageError.what());
 		return false;
 	}
 }
@@ -1014,7 +1014,12 @@ bool JenovaPackageManager::ExtractPackage(const String& packageFile, const Strin
 	ext = archive_write_disk_new();
 	archive_write_disk_set_options(ext, flags);
 	archive_write_disk_set_standard_lookup(ext);
-	if ((r = archive_read_open_filename(a, AS_C_STRING(packageFile), 10240))) return false;
+	if ((r = archive_read_open_filename(a, AS_C_STRING(packageFile), 10240)))
+	{
+		jenova::Error("Jenova Package Manager", "Failed to Open Package Archive [%s], Reason [%d] : %s",
+			AS_C_STRING(packageFile), r, archive_error_string(a));
+		return false;
+	}
 	for (;;)
 	{
 		// Read Next Header
@@ -1126,7 +1131,12 @@ bool JenovaPackageManager::InstallPackage(const String& packageHash)
 	jenova::JenovaPackage package = GetOnlinePackage(packageHash);
 
 	// Validate Package
-	if (package.pkgName == "[NotFound]") return false;
+	if (package.pkgName == "[NotFound]")
+	{
+		jenova::Error("Jenova Package Manager", "No Package Matches the Hash [%s] in the Package Database. It Was Removed Upstream or the Database Is Stale, Refresh It.",
+			AS_C_STRING(packageHash));
+		return false;
+	}
 
 	// Get Package URL
 	String packageFileURL = package.pkgURL;
@@ -1242,7 +1252,11 @@ bool JenovaPackageManager::UninstallPackage(const String& packageHash)
 	jenova::JenovaPackage package = GetOnlinePackage(packageHash);
 
 	// Validate Package
-	if (package.pkgName == "[NotFound]") return false;
+	if (package.pkgName == "[NotFound]")
+	{
+		jenova::Error("Jenova Package Manager", "No Package Matches the Hash [%s], Nothing Was Uninstalled.", AS_C_STRING(packageHash));
+		return false;
+	}
 
 	// Get Package URL
 	std::string installPath = AS_STD_STRING(ProjectSettings::get_singleton()->globalize_path(package.pkgDestination));
@@ -1884,14 +1898,19 @@ bool JenovaPackageManager::PreparePackageManager()
 	if (!packageRepositoryPath.empty() && (packageRepositoryPath.back() == '\\' || packageRepositoryPath.back() == '/')) packageRepositoryPath.pop_back();
 	if (!std::filesystem::exists(packageRepositoryPath))
 	{
-		if (!std::filesystem::create_directories(packageRepositoryPath)) return false;
+		if (!std::filesystem::create_directories(packageRepositoryPath))
+		{
+			jenova::Error("Jenova Package Manager", "Failed to Create the Package Repository at [%s] : %s. No Package Can Be Installed.",
+				packageRepositoryPath.c_str(), strerror(errno));
+			return false;
+		}
 	}
 	
 	// Create Package Directory .gdignore If Not Exists
 	String gdIgnoreFilePath = GetPackageRepositoryPath(true) + ".gdignore";
 	if (!std::filesystem::exists(AS_STD_STRING(gdIgnoreFilePath)))
 	{
-		if (!jenova::WriteStringToFile(gdIgnoreFilePath, " ")) return false;
+		if (!jenova::WriteStringToFile(gdIgnoreFilePath, " ")) return false;		// WriteStringToFile reports the path and the reason itself.
 	}
 
 	// All Good

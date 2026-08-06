@@ -691,11 +691,24 @@ void CPPScriptInstance::RebuildCallCache() const
 
 		std::string shortName = AS_STD_STRING(String(binding.name).get_file());
 		binding.address = JenovaInterpreter::GetPropertyAddress(shortName, cachedIdentity);
-		if (!binding.address) continue;
+		if (!binding.address)
+		{
+			// Dropped silently before. An unbound property reads and writes the module's own
+			// storage instead of this instance's, so the script sees a value that never
+			// changes and nothing anywhere says why.
+			jenova::Error("Jenova Script Instance", "Property [%s] of Script [%s] Has No Address in the Loaded Module and Will Not Be Bound. "
+				"The Module Is Out of Date, Rebuild the Project.", shortName.c_str(), AS_C_STRING(GetIdentity()));
+			continue;
+		}
 
 		binding.typeName = JenovaInterpreter::GetPropertyType(shortName, cachedIdentity);
 		binding.storage = jenova::AllocateVariantBasedProperty(binding.typeName);
-		if (!binding.storage) continue;
+		if (!binding.storage)
+		{
+			jenova::Error("Jenova Script Instance", "Property [%s] of Script [%s] Has Unsupported Type [%s] and Will Not Be Bound.",
+				shortName.c_str(), AS_C_STRING(GetIdentity()), binding.typeName.c_str());
+			continue;
+		}
 
 		// Address of this instance's value inside instanceProperties. Indexing creates the
 		// entry if it is missing, so every script property has a slot from here on and no
